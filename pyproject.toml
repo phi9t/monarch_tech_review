@@ -1,0 +1,24 @@
+[project]
+name = "monarch-gpu-mode"
+version = "0.1.0"
+description = "Marimo notebooks for GPU Mode presentation on Monarch"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "marimo>=0.10.0",
+    "torch>=2.0.0",
+    "transformers>=4.40.0",
+    "torchmonarch>=0.3.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff",
+    "pytest",
+]
+
+[tool.uv]
+dev-dependencies = [
+    "ruff",
+    "pytest",
+]
