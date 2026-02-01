@@ -9,6 +9,8 @@ dependencies = [
     "torch>=2.0.0",
     "transformers>=4.40.0",
     "torchmonarch>=0.3.0",
+    "vllm>=0.6.0",
+    "accelerate",
 ]
 
 [project.optional-dependencies]
@@ -17,8 +19,15 @@ dev = [
     "pytest",
 ]
 
-[tool.uv]
-dev-dependencies = [
+[dependency-groups]
+dev = [
     "ruff",
     "pytest",
 ]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
