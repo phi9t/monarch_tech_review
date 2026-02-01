@@ -433,17 +433,62 @@ def _(all_latencies, mo):
     In a real RL loop, you're mixing tasks of varying difficulty. Some trajectories are short (model gets it right immediately), others are long (multiple tool calls, retries, hitting max turns).
 
     Since the sync loop is sequential, **something is always idle**:
+    """)
+    return
 
-    ```
-    SYNC RL (batch of 4 trajectories):
 
-    Generator 1:  ├── fast ──┤ (waiting...)
-    Generator 2:  ├──── medium ────┤ (waiting...)
-    Generator 3:  ├── fast ──┤ (waiting...)
-    Generator 4:  ├──────────── straggler ──────────────┤
-    Trainer:      (idle...........................) ├─ train ─┤
-    ```
+@app.cell
+def _():
+    def make_sync_plot():
+        import matplotlib.pyplot as plt
+        import matplotlib.patches as mpatches
 
+        # Sync RL visualization - showing straggler problem
+        fig, ax = plt.subplots(figsize=(10, 3))
+
+        # Data: (row, start, duration, color)
+        data = [
+            (0, 0, 3, "#66c2a5"),   # Gen 1: fast
+            (1, 0, 5, "#66c2a5"),   # Gen 2: medium
+            (2, 0, 3, "#66c2a5"),   # Gen 3: fast
+            (3, 0, 10, "#fc8d62"), # Gen 4: straggler (different color)
+            (4, 0, 10, "#d3d3d3"), # Trainer: idle
+            (4, 10, 3, "#e78ac3"), # Trainer: train
+        ]
+
+        for row, start, duration, color in data:
+            ax.barh(row, duration, left=start, height=0.6, color=color, edgecolor="black", linewidth=0.5)
+
+        # Add "idle" and "train" labels
+        ax.text(5, 4, "idle", ha="center", va="center", fontsize=9, color="gray")
+        ax.text(11.5, 4, "train", ha="center", va="center", fontsize=9, color="white", fontweight="bold")
+
+        ax.set_yticks(range(5))
+        ax.set_yticklabels(["Gen 1", "Gen 2", "Gen 3", "Gen 4", "Trainer"])
+        ax.set_xlabel("Time (ms)")
+        ax.set_title("Sync RL - Waiting for Stragglers")
+        ax.grid(axis="x", alpha=0.3)
+        ax.invert_yaxis()
+
+        # Legend
+        patches = [
+            mpatches.Patch(color="#66c2a5", label="Fast/Medium"),
+            mpatches.Patch(color="#fc8d62", label="Straggler"),
+            mpatches.Patch(color="#d3d3d3", label="Idle"),
+            mpatches.Patch(color="#e78ac3", label="Train"),
+        ]
+        ax.legend(handles=patches, loc="upper right", fontsize=8)
+
+        plt.tight_layout()
+        return fig
+
+    make_sync_plot()
+    return
+
+
+@app.cell
+def _(mo):
+    mo.md(r"""
     The **long-tail stragglers** set the pace. At scale, this kills GPU utilization.
     """)
     return
@@ -451,41 +496,44 @@ def _(all_latencies, mo):
 
 @app.cell
 def _(all_latencies):
-    import matplotlib.pyplot as plt
-    import numpy as np
-    from scipy import stats
+    def make_kde_plot(latencies):
+        import matplotlib.pyplot as plt
+        import numpy as np
+        from scipy import stats
 
-    # Group latencies by task
-    task_latencies = {}
-    for entry in all_latencies:
-        task = entry["task"]
-        if task not in task_latencies:
-            task_latencies[task] = []
-        task_latencies[task].append(entry["latency_ms"])
+        # Group latencies by task
+        task_latencies = {}
+        for entry in latencies:
+            task = entry["task"]
+            if task not in task_latencies:
+                task_latencies[task] = []
+            task_latencies[task].append(entry["latency_ms"])
 
-    # Create overlaid KDE plot
-    fig, ax = plt.subplots(figsize=(10, 4))
+        # Create overlaid KDE plot
+        fig, ax = plt.subplots(figsize=(10, 4))
 
-    colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728"]
-    all_lats = [l["latency_ms"] for l in all_latencies]
-    x_range = np.linspace(min(all_lats) * 0.8, max(all_lats) * 1.1, 200)
+        colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728"]
+        all_lats = [l["latency_ms"] for l in latencies]
+        x_range = np.linspace(min(all_lats) * 0.8, max(all_lats) * 1.1, 200)
 
-    for i, (task, lats) in enumerate(task_latencies.items()):
-        # Compute KDE
-        kde = stats.gaussian_kde(lats)
-        density = kde(x_range)
-        ax.fill_between(x_range, density, alpha=0.3, color=colors[i], label=task)
-        ax.plot(x_range, density, color=colors[i], linewidth=2)
+        for i, (task, lats) in enumerate(task_latencies.items()):
+            # Compute KDE
+            kde = stats.gaussian_kde(lats)
+            density = kde(x_range)
+            ax.fill_between(x_range, density, alpha=0.3, color=colors[i], label=task)
+            ax.plot(x_range, density, color=colors[i], linewidth=2)
 
-    ax.set_xlabel("Latency (ms)", fontsize=12)
-    ax.set_ylabel("Density", fontsize=12)
-    ax.set_title("Trajectory Generation Latency Distribution by Task Type", fontsize=14)
-    ax.axvline(x=sum(all_lats) / len(all_lats), color="red", linestyle="--", alpha=0.7, label="mean")
-    ax.legend(loc="upper right")
-    ax.grid(axis="x", alpha=0.3)
+        ax.set_xlabel("Latency (ms)", fontsize=12)
+        ax.set_ylabel("Density", fontsize=12)
+        ax.set_title("Trajectory Generation Latency Distribution by Task Type", fontsize=14)
+        ax.axvline(x=sum(all_lats) / len(all_lats), color="red", linestyle="--", alpha=0.7, label="mean")
+        ax.legend(loc="upper right")
+        ax.grid(axis="x", alpha=0.3)
 
-    plt.tight_layout()
-    plt.gca()
+        plt.tight_layout()
+        return fig
+
+    make_kde_plot(all_latencies)
     return
 
 
@@ -495,20 +543,75 @@ def _(mo):
     ## The Async Solution (and Its Trade-off)
 
     The fix: **decouple generation from training** with a replay buffer.
+    """)
+    return
 
-    ```
-    ASYNC RL:
 
-    Generator 1:  ├─ short ─┼── medium ──┼─ short ─┤
-    Generator 2:  ├── medium ──┼─ short ─┼──── long ────┤
-    Generator 3:  ├──── long ────┼─ short ─┼── medium ──┤
-    Generator 4:  ├─ short ─┼──── long ────┼─ short ─┤
-                        ↓         ↓         ↓
-    Buffer:       ══════════════════════════════════════
-                        ↓         ↓         ↓
-    Trainer:      ├─ train ─┼─ train ─┼─ train ─┼─ train ─┤
-    ```
+@app.cell
+def _():
+    def make_async_plot():
+        import matplotlib.pyplot as plt
+        import matplotlib.patches as mpatches
 
+        # Async RL visualization - showing continuous utilization
+        fig, ax = plt.subplots(figsize=(10, 3.5))
+
+        # Colors for different trajectory lengths
+        color_map = {"short": "#66c2a5", "medium": "#8da0cb", "long": "#fc8d62"}
+
+        # Data: (row, start, duration, type)
+        data = [
+            # Gen 1: short, medium, short
+            (0, 0, 2, "short"), (0, 2, 4, "medium"), (0, 6, 2, "short"),
+            # Gen 2: medium, short, long
+            (1, 0, 4, "medium"), (1, 4, 2, "short"), (1, 6, 6, "long"),
+            # Gen 3: long, short, medium
+            (2, 0, 5, "long"), (2, 5, 2, "short"), (2, 7, 4, "medium"),
+            # Gen 4: short, long, short
+            (3, 0, 2, "short"), (3, 2, 6, "long"), (3, 8, 2, "short"),
+            # Buffer (visual indicator)
+            (4, 0, 12, "#e0e0e0"),
+            # Trainer: continuous training
+            (5, 0, 3, "#e78ac3"), (5, 3, 3, "#e78ac3"), (5, 6, 3, "#e78ac3"), (5, 9, 3, "#e78ac3"),
+        ]
+
+        for item in data:
+            row, start, duration = item[0], item[1], item[2]
+            if isinstance(item[3], str) and item[3] in color_map:
+                color = color_map[item[3]]
+            else:
+                color = item[3]
+            ax.barh(row, duration, left=start, height=0.6, color=color, edgecolor="black", linewidth=0.5)
+
+        # Buffer label
+        ax.text(6, 4, "Buffer", ha="center", va="center", fontsize=9, color="gray")
+
+        ax.set_yticks(range(6))
+        ax.set_yticklabels(["Gen 1", "Gen 2", "Gen 3", "Gen 4", "Buffer", "Trainer"])
+        ax.set_xlabel("Time (ms)")
+        ax.set_title("Async RL - Buffer Absorbs Variance")
+        ax.grid(axis="x", alpha=0.3)
+        ax.invert_yaxis()
+
+        # Legend
+        patches = [
+            mpatches.Patch(color="#66c2a5", label="Short"),
+            mpatches.Patch(color="#8da0cb", label="Medium"),
+            mpatches.Patch(color="#fc8d62", label="Long"),
+            mpatches.Patch(color="#e78ac3", label="Train"),
+        ]
+        ax.legend(handles=patches, loc="upper right", fontsize=8)
+
+        plt.tight_layout()
+        return fig
+
+    make_async_plot()
+    return
+
+
+@app.cell
+def _(mo):
+    mo.md(r"""
     Generators produce trajectories as fast as they can, dropping them in a buffer. The trainer consumes from the buffer independently. Variance doesn't matter - the buffer absorbs it.
 
     ### The Off-Policy Trade-off
@@ -533,43 +636,135 @@ def _(mo):
     mo.md(r"""
     ## Interactive Visualization: Sync vs Async
 
-    Use the sliders to see how different configurations affect GPU utilization:
+    Adjust the parameters to see how generation variance affects sync vs async RL:
     """)
     return
 
 
 @app.cell
 def _(mo):
-    gen_time = mo.ui.slider(100, 2000, value=800, label="Generation time (ms)")
-    train_time = mo.ui.slider(50, 500, value=200, label="Training time (ms)")
-    sync_time = mo.ui.slider(10, 200, value=50, label="Weight sync time (ms)")
-    num_generators = mo.ui.slider(1, 8, value=4, label="Number of generators")
+    num_generators = mo.ui.slider(2, 6, value=4, label="Number of generators")
+    mean_gen_time = mo.ui.slider(100, 500, value=200, label="Mean generation time (ms)")
+    variance = mo.ui.slider(0.1, 2.0, value=0.8, step=0.1, label="Variance (coefficient of variation)")
+    train_time = mo.ui.slider(50, 300, value=100, label="Training time (ms)")
+    num_batches = mo.ui.slider(2, 5, value=3, label="Batches to simulate")
 
-    mo.vstack([gen_time, train_time, sync_time, num_generators])
-    return gen_time, num_generators, sync_time, train_time
+    mo.vstack([num_generators, mean_gen_time, variance, train_time, num_batches])
+    return mean_gen_time, num_batches, num_generators, train_time, variance
 
 
 @app.cell
-def _(gen_time, mo, num_generators, sync_time, train_time):
-    total_sync = gen_time.value + train_time.value + sync_time.value
-    sync_util = train_time.value / total_sync * 100
+def _(mean_gen_time, mo, num_batches, num_generators, train_time, variance):
+    def make_interactive_comparison(n_gens_val, mean_val, var_val, train_val, n_batch_val):
+        import random
+        import matplotlib.pyplot as plt
+        import matplotlib.patches as mpatches
+        import math
 
-    async_gen_throughput = gen_time.value / num_generators.value
-    total_async = max(async_gen_throughput, train_time.value) + sync_time.value
-    async_util = train_time.value / total_async * 100
+        random.seed(42)  # Reproducible for same slider values
 
-    mo.md(f"""
-    ### Results
+        # Sample generation times from log-normal distribution
+        def sample_gen_times(mean, cv, n):
+            if cv < 0.1:
+                return [mean] * n
+            sigma = math.sqrt(math.log(1 + cv**2))
+            mu = math.log(mean) - sigma**2 / 2
+            return [random.lognormvariate(mu, sigma) for _ in range(n)]
 
-    | Metric | Sync RL | Async RL |
-    |--------|---------|----------|
-    | Trainer utilization | {sync_util:.1f}% | {async_util:.1f}% |
-    | Steps/second | {1000/total_sync:.2f} | {1000/total_async:.2f} |
+        # Generate times for each generator across batches
+        gen_times = {}
+        for g in range(n_gens_val):
+            gen_times[g] = sample_gen_times(mean_val, var_val, n_batch_val)
 
-    **Speedup: {total_sync/total_async:.1f}x**
+        # Color palette for batches
+        batch_colors = plt.cm.Set2(range(n_batch_val))
 
-    With {num_generators.value} generators, async RL keeps the trainer {async_util:.0f}% utilized vs {sync_util:.0f}% for sync.
-    """)
+        # ===== SYNC SIMULATION =====
+        sync_bars = []
+        sync_time = 0
+
+        for batch in range(n_batch_val):
+            batch_times = [gen_times[g][batch] for g in range(n_gens_val)]
+            max_time = max(batch_times)
+
+            for g in range(n_gens_val):
+                t = gen_times[g][batch]
+                sync_bars.append((g, sync_time, t, batch_colors[batch]))
+
+            train_start = sync_time + max_time
+            sync_bars.append((n_gens_val, train_start, train_val, "crimson"))
+            sync_time = train_start + train_val
+
+        total_sync_time = sync_time
+
+        # ===== ASYNC SIMULATION =====
+        async_bars = []
+
+        for g in range(n_gens_val):
+            t = 0
+            for batch in range(n_batch_val):
+                duration = gen_times[g][batch]
+                async_bars.append((g, t, duration, batch_colors[batch]))
+                t += duration
+
+        total_gen_time = max(sum(gen_times[g]) for g in range(n_gens_val))
+        t = 0
+        train_batch = 0
+        while t < total_gen_time:
+            async_bars.append((n_gens_val, t, train_val, "crimson"))
+            t += train_val
+            train_batch += 1
+
+        total_async_time = max(total_gen_time, t)
+
+        # ===== PLOTTING =====
+        fig, axes = plt.subplots(1, 2, figsize=(14, 4 + n_gens_val * 0.3))
+        row_labels = [f"Gen {i+1}" for i in range(n_gens_val)] + ["Trainer"]
+
+        for ax, bars, title, total_time in [
+            (axes[0], sync_bars, "Sync RL", total_sync_time),
+            (axes[1], async_bars, "Async RL", total_async_time)
+        ]:
+            for row, start, duration, color in bars:
+                ax.barh(row, duration, left=start, height=0.6, color=color, edgecolor="black", linewidth=0.5)
+            ax.set_yticks(range(len(row_labels)))
+            ax.set_yticklabels(row_labels)
+            ax.set_xlabel("Time (ms)")
+            ax.set_title(f"{title} (total: {total_time:.0f}ms)")
+            ax.set_xlim(0, max(total_sync_time, total_async_time) * 1.05)
+            ax.grid(axis="x", alpha=0.3)
+            ax.invert_yaxis()
+
+        # Legend
+        patches = [mpatches.Patch(color=batch_colors[i], label=f"Batch {i+1}") for i in range(n_batch_val)]
+        patches.append(mpatches.Patch(color="crimson", label="Train"))
+        axes[1].legend(handles=patches, loc="upper right", fontsize=8)
+
+        plt.tight_layout()
+
+        # Calculate utilization
+        total_train_sync = n_batch_val * train_val
+        sync_util = total_train_sync / total_sync_time * 100
+        async_util = min(100, train_batch * train_val / total_async_time * 100)
+
+        return fig, total_sync_time, total_async_time, sync_util, async_util
+
+    fig, total_sync, total_async, sync_util, async_util = make_interactive_comparison(
+        num_generators.value, mean_gen_time.value, variance.value, train_time.value, num_batches.value
+    )
+
+    mo.vstack([
+        fig,
+        mo.md(f"""
+| Metric | Sync RL | Async RL |
+|--------|---------|----------|
+| Total time | {total_sync:.0f}ms | {total_async:.0f}ms |
+| Trainer utilization | {sync_util:.0f}% | {async_util:.0f}% |
+| **Speedup** | - | **{total_sync/total_async:.1f}x** |
+
+**Try increasing the variance slider** to see how stragglers hurt sync RL while async handles them gracefully.
+        """)
+    ])
     return
 
 
@@ -589,11 +784,6 @@ def _(mo):
     - Weight synchronization between them
     - Fault tolerance when things go wrong
     """)
-    return
-
-
-@app.cell
-def _():
     return
 
 
