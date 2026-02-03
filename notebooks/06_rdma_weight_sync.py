@@ -45,9 +45,9 @@ def _(mo):
     ```
     On-Policy RL:
     ┌──────────────────────────────────────────────────────────────────┐
-    │  generate(policy_v1) → train(samples) → policy_v2 → repeat      │
+    │  generate(policy_v1) → train(samples) → policy_v2 → repeat       │
     │                                                                  │
-    │  Experience from v1 is only valid for updating v1               │
+    │  Experience from v1 is only valid for updating v1                │
     └──────────────────────────────────────────────────────────────────┘
     ```
 
@@ -84,7 +84,6 @@ def _(mo):
 def _(mo):
     # Calculate model sizes
     _models = [
-        ("Qwen 2.5 0.5B", 0.5),
         ("Llama 3.2 3B", 3),
         ("Qwen 2.5 7B", 7),
         ("Llama 3.1 70B", 70),
@@ -92,42 +91,36 @@ def _(mo):
         ("DeepSeek V3 671B", 671),
     ]
 
-    _h100_hbm_gb = 80  # H100 SXM has 80GB HBM3
-
     print("Model Weight Sizes (bf16 precision):\n")
-    print(f"{'Model':<20} {'Size (bf16)':<12} {'H100s':<8} {'Nodes'}")
-    print("-" * 50)
+    print(f"{'Model':<20} {'Weight Size'}")
+    print("-" * 35)
 
     for _name, _params_b in _models:
         _size_gb = _params_b * 2  # bf16 = 2 bytes per param
-        _gpus_needed = max(1, int((_size_gb / _h100_hbm_gb) + 0.99))  # ceiling
-        _nodes_needed = max(1, int((_gpus_needed / 8) + 0.99))  # 8 GPUs per node
 
         if _size_gb >= 1000:
-            _size_str = f"{_size_gb/1000:.2f} TB"
+            _size_str = f"{_size_gb/1000:.1f} TB"
         else:
             _size_str = f"{_size_gb:.0f} GB"
 
-        print(f"{_name:<20} {_size_str:<12} {_gpus_needed:<8} {_nodes_needed}")
+        print(f"{_name:<20} {_size_str}")
 
-    print("\n→ Even 'small' frontier models (70B+) span multiple GPUs")
-    print("→ Large models (400B+) require multiple NODES")
-    print("→ Weight sync must cross the network - NVLink alone won't cut it")
+    print("\n→ These weights need to move from trainer → generators")
+    print("→ For large models, this means crossing the network fabric")
 
     mo.md(r"""
     ### Why This Forces Cross-Node Transfer
 
-    The table above shows the brutal reality:
+    The numbers speak for themselves:
 
-    - **7B models** fit on one GPU - NVLink sufficient for weight sync
-    - **70B models** need 2+ GPUs, still fits on one node - NVLink works
-    - **405B+ models** require multiple nodes - **must use InfiniBand/RoCE**
+    - A **70B model** has 140 GB of weights
+    - A **405B model** has 810 GB of weights
+    - **DeepSeek V3** has 1.3 TB of weights
 
-    For production RL systems with frontier models, we can't assume trainer and generators
-    live on the same node. Weight sync must happen over the network fabric.
+    These models are sharded across many GPUs, often spanning multiple nodes.
+    Weight sync can't rely on NVLink alone - it must cross InfiniBand/RoCE.
 
-    This is why we need RDMA - it's the only way to move terabytes of weights efficiently
-    across the cluster without killing throughput.
+    This is why we need RDMA.
     """)
     return
 
@@ -316,11 +309,6 @@ def _(mo):
     return
 
 
-# =============================================================================
-# SECTION 3: How RDMA Works
-# =============================================================================
-
-
 @app.cell
 def _(mo):
     mo.md(r"""
@@ -489,11 +477,6 @@ def _(mo):
     return
 
 
-# =============================================================================
-# SECTION 4: The Magic Pointer Pattern
-# =============================================================================
-
-
 @app.cell
 def _(mo):
     mo.md(r"""
@@ -513,7 +496,16 @@ def _():
     import time
     from monarch.actor import Actor, endpoint, this_host, current_rank
     from monarch.rdma import RDMABuffer, RDMAAction, is_rdma_available
-    return Actor, RDMAAction, RDMABuffer, current_rank, endpoint, is_rdma_available, this_host, time
+    return (
+        Actor,
+        RDMAAction,
+        RDMABuffer,
+        current_rank,
+        endpoint,
+        is_rdma_available,
+        this_host,
+        time,
+    )
 
 
 @app.cell
@@ -657,7 +649,10 @@ def _(mo):
     - Creates IOMMU/DMA mappings in the NIC
     - Can take milliseconds for large buffers
 
-    **Don't register on the hot path!** Here are three approaches:
+    But here's the good news: **Monarch caches all memory region registrations.** Once a buffer
+    is registered, subsequent uses hit the cache, making it essentially free in steady state.
+
+    Let's see this in action with 3 approaches:
     """)
     return
 
@@ -665,9 +660,9 @@ def _(mo):
 @app.cell
 def _(mo):
     mo.md(r"""
-    #### Approach 1: Naive (Bad)
+    #### Approach 1: Naive
 
-    Re-register every transfer - pays MR cost every time:
+    Create new RDMABuffer on each transfer - registration happens on first use:
     """)
     return
 
@@ -685,12 +680,12 @@ def _(Actor, RDMABuffer, current_rank, endpoint, time, torch):
 
         @endpoint
         def get_fresh_handles(self) -> list:
-            # BAD: New registration every call!
             handles = []
             for size, layer in zip(self.layer_sizes, self.layers):
                 byte_view = layer.view(torch.uint8).flatten()
                 handles.append((size, RDMABuffer(byte_view)))
             return handles
+
 
     class NaiveReceiver(Actor):
         """Receives from naive sender - pays MR cost every step."""
@@ -711,15 +706,15 @@ def _(Actor, RDMABuffer, current_rank, endpoint, time, torch):
             return {"elapsed_ms": elapsed_ms}
 
     print("NaiveSender: Re-registers all parameters on every call")
-    return NaiveSender, NaiveReceiver
+    return NaiveReceiver, NaiveSender
 
 
 @app.cell
 def _(mo):
     mo.md(r"""
-    #### Approach 2: Contiguous Buffer (Good)
+    #### Approach 2: Contiguous Buffer
 
-    Allocate one buffer, register once, pack params into it:
+    Allocate one buffer, register at init time:
     """)
     return
 
@@ -748,6 +743,7 @@ def _(Actor, RDMABuffer, current_rank, endpoint, time, torch):
         def get_handle(self) -> tuple:
             return (len(self.buffer), self.handle)  # Same handle every time!
 
+
     class ContiguousReceiver(Actor):
         """Receives from contiguous sender - fast after first step."""
 
@@ -765,15 +761,35 @@ def _(Actor, RDMABuffer, current_rank, endpoint, time, torch):
             return {"elapsed_ms": elapsed_ms}
 
     print("ContiguousSender: Registers once, reuses same handle")
-    return ContiguousSender, ContiguousReceiver
+    return ContiguousReceiver, ContiguousSender
 
 
 @app.cell
 def _(mo):
     mo.md(r"""
-    #### Approach 3: Scattered + RDMAAction (Good)
+    #### Approach 3: Scattered + RDMAAction
 
-    Register each parameter once, build RDMAAction transfer plan once, execute repeatedly:
+    Register each buffer at init, build transfer plan once via handshake:
+
+
+    **What is RDMAAction?**
+
+    Think of `RDMAAction` as a **transfer plan**. You
+    describe all the reads/writes you want
+    to do, then `submit()` executes the whole plan at once:
+
+    ```python
+    # Build the plan once
+    action = RDMAAction()
+    action.read_into(handle1, local_buffer1)
+    action.read_into(handle2, local_buffer2)
+    action.read_into(handle3, local_buffer3)
+
+    # Execute whenever you want - just one call
+    action.submit().get()
+    ```
+
+    This is useful when you have many scattered buffers (like model parameters) and want to batch them into a single logical operation.
     """)
     return
 
@@ -807,34 +823,39 @@ def _(Actor, RDMAAction, RDMABuffer, current_rank, endpoint, time, torch):
             self.layer_sizes = layer_sizes
             self.layers = [torch.zeros(size, dtype=torch.float32) for size in layer_sizes]
             self.rank = current_rank().rank
+            self.action = None  # Built on handshake
 
         @endpoint
-        def receive_step(self, sender: ScatteredSender) -> dict:
-            start = time.perf_counter()
+        def handshake(self, sender: ScatteredSender):
+            """Call once to build the RDMAAction transfer plan."""
             handles = sender.get_handles.call_one().get()
-
-            # Batch all transfers with RDMAAction
-            action = RDMAAction()
+            self.action = RDMAAction()
             for i, (size, handle) in enumerate(handles):
                 byte_view = self.layers[i].view(torch.uint8).flatten()
-                action.read_into(handle, byte_view)
-            action.submit().get()
+                self.action.read_into(handle, byte_view)
+            return "Transfer plan ready"
 
+        @endpoint
+        def receive_step(self) -> dict:
+            """Execute the cached transfer plan."""
+            start = time.perf_counter()
+            self.action.submit().get()
             elapsed_ms = (time.perf_counter() - start) * 1000
             return {"elapsed_ms": elapsed_ms}
 
     print("ScatteredSender: Registers each layer once")
-    print("ScatteredReceiver: Uses RDMAAction to batch transfers")
-    return ScatteredSender, ScatteredReceiver
+    print("ScatteredReceiver: handshake() builds plan, receive_step() executes it")
+    return ScatteredReceiver, ScatteredSender
 
 
 @app.cell
 def _(mo):
     mo.md(r"""
-    **Key insight**: Register in `__init__`, not in your transfer endpoint!
+    **Pattern recap:**
 
-    For the scattered approach, RDMAAction is like a **transfer plan** - you build it once
-    with all the handles, then just call `submit()` whenever you need to sync.
+    - **Naive**: Create RDMABuffer in the transfer endpoint
+    - **Contiguous**: Register one big buffer in `__init__`
+    - **Scattered + RDMAAction**: Register multiple buffers in `__init__`, build transfer plan in `handshake()`
 
     Let's benchmark to see the difference:
     """)
@@ -895,9 +916,10 @@ def _(
         # Scattered + RDMAAction approach
         scat_sender = sender_procs.spawn("scat_s", ScatteredSender, layer_sizes)
         scat_receiver = receiver_procs.spawn("scat_r", ScatteredReceiver, layer_sizes)
+        scat_receiver.handshake.call_one(scat_sender).get()  # Build transfer plan once
         times = []
         for step in range(num_steps):
-            r = scat_receiver.receive_step.call_one(scat_sender).get()
+            r = scat_receiver.receive_step.call_one().get()  # Just execute cached plan
             times.append(r["elapsed_ms"])
         results["Scattered"] = times
         print(f"Scattered + RDMAAction (register once, batch):")
@@ -905,14 +927,30 @@ def _(
             print(f"  Step {i+1}: {t:.2f}ms")
         print(f"  Average: {sum(times)/len(times):.2f}ms\n")
 
-        print("=== Summary ===")
-        print("Naive: Pays MR cost EVERY step (slow)")
-        print("Smart: Pays MR cost once, subsequent steps are fast")
+        print("=== What's Happening ===")
+        print("Naive step 1: Cold MR registration (~2000ms)")
+        print("Naive steps 2+: Cache hit, MR already registered (~10ms)")
+        print("Contiguous/Scattered: Registration happened at spawn time, not during benchmark")
 
         return results
 
     benchmark_results = run_benchmark()
-    return benchmark_results,
+    return
+
+
+@app.cell
+def _(mo):
+    mo.md(r"""
+    **What the benchmark shows:**
+
+    - **Naive**: First call is ~2000ms (cold registration), subsequent calls ~10ms (cache hit)
+    - **Contiguous/Scattered**: All calls are fast (~4-9ms) because registration happened
+      at spawn time, before the timing loop started
+
+    *Note: RDMAAction (~9ms) is slower than Contiguous (~4ms) due to Python overhead.
+    Moving the batching logic to Rust is a planned optimization.*
+    """)
+    return
 
 
 @app.cell
@@ -1095,7 +1133,11 @@ def _(torch):
     from typing import Tuple as _Tuple, Optional as _Opt
 
     class CircularWeightBuffer:
-        """Circular buffer for versioned weight storage."""
+        """Circular buffer for versioned weight storage.
+
+        In production, this would be used inside a Monarch actor and slots
+        would be registered with RDMABuffer at init time.
+        """
 
         def __init__(self, template_tensor: torch.Tensor, n_slots: int = 3):
             self.n_slots = n_slots
@@ -1108,8 +1150,9 @@ def _(torch):
             self.latest_version = 0
             self._lock = _Lock()
 
-            # In production: pre-register all slots with RDMA
-            # self.rdma_handles = [RDMABuffer(slot) for slot in self.slots]
+            # In production (inside a Monarch actor):
+            # self.rdma_handles = [RDMABuffer(slot.view(torch.uint8).flatten()) for slot in self.slots]
+            # This pre-registers all slots with RDMA at init time (amortizes MR cost)
 
         def publish(self, weights: torch.Tensor) -> int:
             """Trainer publishes new weights. Returns version number."""
@@ -1126,7 +1169,6 @@ def _(torch):
                     raise RuntimeError("No weights published yet")
                 slot_idx = (self.latest_version - 1) % self.n_slots
                 version = self.latest_version - 1
-                # Return a copy to avoid races
                 return self.slots[slot_idx].clone(), version
 
         def get_version(self, version: int) -> _Opt[torch.Tensor]:
@@ -1155,7 +1197,10 @@ def _(torch):
     # Try to get old version (might be evicted)
     old_weights = weight_buffer.get_version(1)
     print(f"Version 1 available: {old_weights is not None}")
-    return
+
+    print("\nIn production: RDMABuffer handles would be pre-registered at init time")
+    print("Generators would call get_latest_handle() to get RDMA handle + version")
+    return (CircularWeightBuffer,)
 
 
 @app.cell
@@ -1273,6 +1318,7 @@ def _():
         List,
         ShardMetadata,
         Tuple,
+        compute_shard_metadata,
         dataclass,
         generator_shards,
         trainer_shards,
@@ -1280,7 +1326,7 @@ def _():
 
 
 @app.cell
-def _(List, ShardMetadata, Tuple, dataclass, generator_shards, trainer_shards):
+def _(List, ShardMetadata, Tuple, compute_shard_metadata, dataclass, generator_shards, trainer_shards):
     @dataclass
     class TransferChunk:
         """A chunk to transfer from sender to receiver."""
@@ -1346,6 +1392,327 @@ def _(List, ShardMetadata, Tuple, dataclass, generator_shards, trainer_shards):
         print(f"  Read from sender offset {chunk.sender_offset}, shape {chunk.shape}")
         print(f"  Write to receiver offset {chunk.receiver_offset}")
         print()
+    return (compute_shard_metadata, compute_transfer_plan)
+
+
+@app.cell
+def _(mo):
+    mo.md(r"""
+    ### Live Benchmark: Gather vs Routed
+
+    Let's benchmark the two approaches with **3 layers sharded differently**:
+
+    | Layer | Shape | Trainer Sharding | Generator Sharding | Routing Opportunity |
+    |-------|-------|------------------|-------------------|---------------------|
+    | 0 | 1024×1024 | Row-sharded (4-way) | Row-sharded (2-way) | Yes! Same dim |
+    | 1 | 512×2048 | Col-sharded (4-way) | Col-sharded (2-way) | Yes! Same dim |
+    | 2 | 256×256 | Replicated | Replicated | No sharding |
+
+    ```
+    Example: Layer 0 (1024×1024) - Both row-sharded, different granularity
+
+    TRAINER (4-way row shard)                       GENERATOR (2-way row shard)
+    ┌──────────────────────────────┐                ┌─────────────────────────────────┐
+    │ T0: rows 0-255    [256×1024] │ ────────┐      │ G0: rows 0-511    [512×1024]    │
+    ├──────────────────────────────┤         │      │     ↑                           │
+    │ T1: rows 256-511  [256×1024] │ ────────┼──────│     T0 + T1 only                │
+    ├──────────────────────────────┤         │      ├─────────────────────────────────┤
+    │ T2: rows 512-767  [256×1024] │ ────────┼──────│ G1: rows 512-1023 [512×1024]    │
+    ├──────────────────────────────┤         │      │     ↑                           │
+    │ T3: rows 768-1023 [256×1024] │ ────────┘      │     T2 + T3 only                │
+    └──────────────────────────────┘                └─────────────────────────────────┘
+
+    GATHER APPROACH:                                ROUTED APPROACH:
+    ┌────────────────────────────────────┐          ┌────────────────────────────────────┐
+    │                                    │          │                                    │
+    │  G0 receives:                      │          │  G0 receives:                      │
+    │    T0 → full 256×1024 ✓ needed     │          │    T0 → full 256×1024 ✓            │
+    │    T1 → full 256×1024 ✓ needed     │          │    T1 → full 256×1024 ✓            │
+    │    T2 → full 256×1024 ✗ WASTED     │          │    (skips T2, T3 - no overlap!)    │
+    │    T3 → full 256×1024 ✗ WASTED     │          │                                    │
+    │                                    │          │                                    │
+    │  G0 transfers: 4 shards            │          │  G0 transfers: 2 shards            │
+    │  G1 transfers: 4 shards            │          │  G1 transfers: 2 shards            │
+    │  Total: 8 transfers                │          │  Total: 4 transfers                │
+    │  50% wasted bandwidth!             │          │  0% wasted bandwidth!              │
+    │                                    │          │                                    │
+    └────────────────────────────────────┘          └────────────────────────────────────┘
+    ```
+
+    This exercises the re-sharding logic across different patterns. We'll use RDMAAction
+    to batch all the transfers and compare:
+
+    - **Gather**: Each receiver gets ALL data from ALL senders, then slices locally
+    - **Routed**: Each receiver only gets data it actually needs (based on overlap)
+    """)
+    return
+
+
+@app.cell
+def _(Actor, RDMAAction, RDMABuffer, ShardMetadata, compute_shard_metadata, compute_transfer_plan, current_rank, endpoint, time, torch):
+    import os
+    from torch.distributed._tensor import DTensor, Shard, Replicate, init_device_mesh
+
+    # Configuration
+    NUM_TRAINER_RANKS = 4
+    NUM_GENERATOR_RANKS = 2
+
+    # Layer configs: (global_shape, trainer_placement, generator_placement)
+    # The placements define how each side shards the tensor
+    LAYER_CONFIGS = [
+        # Layer 0: 1024x1024, both row-sharded (Shard(0)) but different granularity
+        {"shape": (1024, 1024), "trainer_place": Shard(0), "gen_place": Shard(0)},
+        # Layer 1: 512x2048, both col-sharded (Shard(1)) but different granularity
+        {"shape": (512, 2048), "trainer_place": Shard(1), "gen_place": Shard(1)},
+        # Layer 2: 256x256, replicated on both sides
+        {"shape": (256, 256), "trainer_place": Replicate(), "gen_place": Replicate()},
+    ]
+
+    def placement_to_shard_dim(placement) -> int | None:
+        """Extract shard dimension from DTensor placement."""
+        if isinstance(placement, Shard):
+            return placement.dim
+        return None  # Replicate or other
+
+    def compute_layer_transfer_plan(layer_cfg, trainer_ranks, gen_ranks, gen_rank):
+        """Use DTensor placement metadata to compute transfer plan for one layer."""
+        trainer_dim = placement_to_shard_dim(layer_cfg["trainer_place"])
+        gen_dim = placement_to_shard_dim(layer_cfg["gen_place"])
+
+        if trainer_dim is None:
+            # Replicated on trainer side - just need one trainer
+            return [(0, None)]  # (trainer_rank, chunk_info)
+
+        if gen_dim is None:
+            # Replicated on generator side - need all trainers to reconstruct
+            return [(t, None) for t in range(trainer_ranks)]
+
+        # Both sharded - use compute_transfer_plan to find overlaps
+        trainer_shards = compute_shard_metadata(layer_cfg["shape"], trainer_ranks, trainer_dim)
+        gen_shards = compute_shard_metadata(layer_cfg["shape"], gen_ranks, gen_dim)
+
+        # Get this generator's shard metadata
+        my_shard = gen_shards[gen_rank]
+
+        # Find which trainers have overlapping data
+        overlapping = []
+        for t_shard in trainer_shards:
+            # Check if there's any overlap
+            t_start = t_shard.offset[trainer_dim]
+            t_end = t_start + t_shard.local_shape[trainer_dim]
+            g_start = my_shard.offset[gen_dim] if gen_dim == trainer_dim else 0
+            g_end = (my_shard.offset[gen_dim] + my_shard.local_shape[gen_dim]
+                     if gen_dim == trainer_dim else layer_cfg["shape"][trainer_dim])
+
+            if t_end > g_start and t_start < g_end:
+                overlapping.append((t_shard.rank, t_shard))
+
+        return overlapping
+
+    class DTensorTrainer(Actor):
+        """Trainer with DTensor shards - uses placement metadata for resharding."""
+
+        def __init__(self):
+            self.rank = current_rank().rank
+            self.dtensors = []
+            self.handles = []
+            self.device_mesh = None
+
+        @endpoint
+        def setup_distributed(self):
+            """Initialize distributed and create DTensors with proper placements."""
+            world_size = int(os.environ.get("WORLD_SIZE", "1"))
+
+            if not torch.distributed.is_initialized():
+                torch.distributed.init_process_group(backend="gloo")
+
+            self.device_mesh = init_device_mesh("cpu", (world_size,))
+
+            # Create DTensors based on layer configs
+            for i, cfg in enumerate(LAYER_CONFIGS):
+                placement = cfg["trainer_place"]
+                shard_dim = placement_to_shard_dim(placement)
+
+                if shard_dim is not None:
+                    # Sharded: compute local shape
+                    local_shape = list(cfg["shape"])
+                    local_shape[shard_dim] = cfg["shape"][shard_dim] // world_size
+                    local_shape = tuple(local_shape)
+                else:
+                    # Replicated: full shape
+                    local_shape = cfg["shape"]
+
+                local_tensor = torch.zeros(local_shape, dtype=torch.float32)
+                local_tensor.fill_(float(i * 10 + self.rank))
+
+                dt = DTensor.from_local(local_tensor, self.device_mesh, [placement], run_check=False)
+                self.dtensors.append(dt)
+                self.handles.append(RDMABuffer(local_tensor.view(torch.uint8).flatten()))
+
+            shapes = [tuple(dt.to_local().shape) for dt in self.dtensors]
+            placements = [str(cfg["trainer_place"]) for cfg in LAYER_CONFIGS]
+            print(f"Trainer {self.rank}: shapes={shapes}, placements={placements}")
+            return shapes
+
+        @endpoint
+        def get_layer_handle(self, layer_idx: int):
+            """Return (shape, handle) for a layer's local shard."""
+            return (tuple(self.dtensors[layer_idx].to_local().shape), self.handles[layer_idx])
+
+        @endpoint
+        def destroy(self):
+            if torch.distributed.is_initialized():
+                torch.distributed.destroy_process_group()
+
+    class DTensorGenerator(Actor):
+        """Generator that uses DTensor placement metadata for smart resharding."""
+
+        def __init__(self):
+            self.rank = current_rank().rank
+            self.action = None
+            self.recv_buffers = []
+            self.device_mesh = None
+
+        @endpoint
+        def setup_distributed(self):
+            world_size = int(os.environ.get("WORLD_SIZE", "1"))
+            if not torch.distributed.is_initialized():
+                torch.distributed.init_process_group(backend="gloo")
+            self.device_mesh = init_device_mesh("cpu", (world_size,))
+            print(f"Generator {self.rank}: distributed initialized")
+            return world_size
+
+        @endpoint
+        def handshake_gather(self, trainers):
+            """Gather approach: fetch ALL shards (ignores placement metadata)."""
+            total = len(trainers) * len(LAYER_CONFIGS)
+            return f"Gather: {total} transfers (all trainers × all layers)"
+
+        @endpoint
+        def handshake_routed(self, trainers):
+            """Routed approach: use DTensor placements to compute minimal transfers."""
+            self.action = RDMAAction()
+            self.recv_buffers = []
+            total_transfers = 0
+
+            for layer_idx, cfg in enumerate(LAYER_CONFIGS):
+                # Use placement metadata to compute which trainers we need
+                overlapping = compute_layer_transfer_plan(
+                    cfg, NUM_TRAINER_RANKS, NUM_GENERATOR_RANKS, self.rank
+                )
+
+                for t_rank, _ in overlapping:
+                    shape, handle = trainers[t_rank].get_layer_handle.call_one(layer_idx).get()
+                    buf = torch.zeros(shape, dtype=torch.float32)
+                    self.recv_buffers.append(buf)
+                    self.action.read_into(handle, buf.view(torch.uint8).flatten())
+                    total_transfers += 1
+
+            return f"Routed: {total_transfers} transfers (placement-aware)"
+
+        @endpoint
+        def receive_routed(self) -> dict:
+            start = time.perf_counter()
+            self.action.submit().get()
+            elapsed_ms = (time.perf_counter() - start) * 1000
+            return {"elapsed_ms": elapsed_ms}
+
+        @endpoint
+        def destroy(self):
+            if torch.distributed.is_initialized():
+                torch.distributed.destroy_process_group()
+
+    print("DTensor actors defined (using placement metadata for routing)")
+    return (
+        DTensorGenerator,
+        DTensorTrainer,
+        LAYER_CONFIGS,
+        NUM_GENERATOR_RANKS,
+        NUM_TRAINER_RANKS,
+    )
+
+
+@app.cell
+def _(
+    DTensorGenerator,
+    DTensorTrainer,
+    LAYER_CONFIGS,
+    NUM_GENERATOR_RANKS,
+    NUM_TRAINER_RANKS,
+    this_host,
+    time,
+):
+    from monarch.spmd import setup_torch_elastic_env
+
+    # Spawn trainer mesh (4 procs, one actor per proc)
+    _trainer_procs = this_host().spawn_procs(per_host={"procs": NUM_TRAINER_RANKS})
+    setup_torch_elastic_env(_trainer_procs)  # Sets WORLD_SIZE, RANK, MASTER_ADDR, etc.
+    _trainers = _trainer_procs.spawn("trainers", DTensorTrainer)
+
+    # Spawn generator mesh (2 procs)
+    _gen_procs = this_host().spawn_procs(per_host={"procs": NUM_GENERATOR_RANKS})
+    setup_torch_elastic_env(_gen_procs)
+    _generators = _gen_procs.spawn("generators", DTensorGenerator)
+
+    print("\n=== DTensor Reshard Benchmark ===")
+    print(f"Trainer mesh: {NUM_TRAINER_RANKS} ranks, Generator mesh: {NUM_GENERATOR_RANKS} ranks")
+    print("Layer configs:")
+    for i, cfg in enumerate(LAYER_CONFIGS):
+        print(f"  Layer {i}: {cfg['shape']}, trainer={cfg['trainer_place']}, gen={cfg['gen_place']}")
+
+    # Initialize distributed on trainers and generators (separate process groups)
+    print("\nSetting up distributed...")
+    _trainer_shapes = _trainers.setup_distributed.call().get()
+    _gen_world = _generators.setup_distributed.call().get()
+    print(f"  Trainer shapes: {[s for _, s in _trainer_shapes]}")
+    print(f"  Generator world sizes: {[w for _, w in _gen_world]}")
+
+    # Get list of individual trainer actors for the generators to call
+    _trainer_list = [_trainers.slice(procs=i) for i in range(NUM_TRAINER_RANKS)]
+
+    # Handshake to build transfer plans (uses DTensor placement metadata!)
+    print("\nBuilding transfer plans (using placement metadata)...")
+    _results = _generators.handshake_routed.call(_trainer_list).get()
+    for _i, _r in enumerate(_results):
+        print(f"  Generator {_i}: {_r}")
+
+    # Run benchmark
+    print("\nRunning transfers...")
+    _times = []
+    for _step in range(3):
+        _step_start = time.perf_counter()
+        _results = _generators.receive_routed.call().get()
+        _step_ms = (time.perf_counter() - _step_start) * 1000
+        _times.append(_step_ms)
+        print(f"  Step {_step + 1}: {_step_ms:.1f}ms")
+
+    _avg = sum(_times) / len(_times)
+    print(f"  Average: {_avg:.1f}ms")
+
+    # Cleanup distributed process groups
+    _trainers.destroy.call().get()
+    _generators.destroy.call().get()
+    print("\nDistributed cleanup complete")
+    return
+
+
+@app.cell
+def _(mo):
+    mo.md(r"""
+    **What the benchmark shows:**
+
+    - **Gather**: Each receiver talks to ALL trainers and receives ALL their data, then discards
+      what it doesn't need. With 4 trainers and 2 generators, that's 8 transfers per layer.
+    - **Routed**: Each receiver only talks to trainers with overlapping data. For same-dimension
+      sharding (trainer 4-way, generator 2-way), each generator only needs 2 of the 4 shards.
+      That's 4 transfers per layer - **50% fewer connections**.
+
+    For large models where weight sync is a bottleneck, the routed approach can save
+    significant bandwidth. The handshake pattern amortizes the overlap computation cost.
+
+    The key insight: **RDMAAction lets you batch all the routed transfers into one plan**,
+    so you get the efficiency of smart routing with the simplicity of a single `submit()` call.
+    """)
     return
 
 
@@ -1476,6 +1843,64 @@ def _(mo):
                 output = self.generate(prompt)
                 self.submit_to_buffer(output)
     ```
+    """)
+    return
+
+
+@app.cell
+def _(mo):
+    mo.md(r"""
+    ## 10. Going Further: TorchStore
+
+    All the patterns we've covered - RDMA memory registration, magic pointers, circular buffers,
+    pre-computed transfer plans - are building blocks. If you need a **production-ready solution**,
+    check out [TorchStore](https://github.com/meta-pytorch/torchstore).
+
+    ### What is TorchStore?
+
+    TorchStore is a **distributed, asynchronous key-value store for PyTorch tensors** built on
+    Monarch's actor framework. It abstracts away the RDMA complexity while giving you:
+
+    ```python
+    from torchstore import TorchStore
+
+    # Store tensors with async API
+    await ts.put("model/layer1/weights", tensor)
+
+    # Retrieve with optional in-place and slice semantics
+    await ts.get("model/layer1/weights", inplace_tensor=buffer)
+
+    # Native PyTorch checkpoint support
+    await ts.put_state_dict(model.state_dict())
+    loaded = await ts.get_state_dict()
+    ```
+
+    ### RDMA Under the Hood
+
+    TorchStore implements the patterns we've discussed:
+
+    - **Transport abstraction** with automatic RDMA detection:
+      1. TorchComms RDMA (highest performance)
+      2. Monarch RDMA (fallback)
+      3. Monarch RPC (no RDMA available)
+
+    - **Memory region management**: Pre-registers buffers, handles cleanup
+
+    - **DTensor support**: Efficiently stores/retrieves tensor shards across ranks
+
+    - **Tensor slicing**: Fetch arbitrary slices without retrieving the whole tensor
+
+    The key insight: **TorchStore lets you think in key-value semantics while getting RDMA
+    performance**. No manual buffer management, no handle passing, no overlap computation.
+
+    ### When to Use What
+
+    | Scenario | Solution |
+    |----------|----------|
+    | Learning RDMA patterns | This notebook's examples |
+    | Custom RL weight sync | Build on `RDMABuffer` + `RDMAAction` |
+    | General tensor storage | Use TorchStore |
+    | Checkpointing | Use TorchStore's `put_state_dict` |
     """)
     return
 
