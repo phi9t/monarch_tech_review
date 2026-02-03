@@ -110,9 +110,9 @@ def _(mo):
     # But now you can also build arbitrary actor systems
     # Spawn actors across processes
     host = this_host()
-    trainer_procs = host.spawn_procs({"procs": 1})
-    generator_procs = host.spawn_procs({"procs": 4})
-    reward_procs = host.spawn_procs({"procs": 1})
+    trainer_procs = host.spawn_procs(per_host={"gpus": 1})
+    generator_procs = host.spawn_procs(per_host={"gpus": 4})
+    reward_procs = host.spawn_procs(per_host={"gpus": 1})
 
     trainer = trainer_procs.spawn("trainer", TrainerActor)
     generators = generator_procs.spawn("generators", GeneratorActor)
@@ -349,12 +349,12 @@ def _():
 
     # Spawn two actors on separate processes
     host = this_host()
-    procs = host.spawn_procs({"procs": 2})
+    procs = host.spawn_procs(per_host={"gpus": 2})
     actors = procs.spawn("players", PingPong, "Player")
 
     # Get individual actors via slicing
-    alice = actors.slice(procs=0)
-    bob = actors.slice(procs=1)
+    alice = actors.slice(gpus=0)
+    bob = actors.slice(gpus=1)
 
     # Play ping pong
     for i in range(3):
