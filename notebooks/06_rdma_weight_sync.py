@@ -11,6 +11,16 @@ def _():
 
 
 @app.cell
+def _():
+    # Shared imports for the notebook
+    import time
+    import torch
+    from monarch.actor import Actor, endpoint, this_host, current_rank
+    from monarch.rdma import RDMABuffer, is_rdma_available
+    return Actor, RDMABuffer, endpoint, is_rdma_available, this_host, time, torch
+
+
+@app.cell
 def _(mo):
     mo.md(r"""
     # RDMA & Weight Synchronization
@@ -22,12 +32,15 @@ def _(mo):
     1. **Why Weight Sync Matters** - On-policy vs off-policy, model scale
     2. **The Bandwidth Hierarchy** - NVLink, InfiniBand, PCIe
     3. **The Problem: Collectives Are Blocking** - Why RL needs something different
-    4. **How RDMA Works** - ibverbs, one-sided operations
-    5. **The Magic Pointer Pattern** - Control plane vs data plane separation
-    6. **CPU Staging** - Decoupling trainer and generator timing
-    7. **Circular Weight Buffers** - Versioning without memory churn
-    8. **Weight Re-sharding** - Handling different tensor layouts
-    9. **Putting It All Together** - The complete pattern
+    4. **The Magic Pointer Pattern** - Control plane vs data plane separation
+    5. **CPU Staging** - Decoupling trainer and generator timing
+    6. **Circular Weight Buffers** - Versioning without memory churn
+    7. **Weight Re-sharding** - Handling different tensor layouts
+    8. **Putting It All Together** - Live demo with concurrent loops
+
+    **Want to go deeper?** Check out **06b_weight_sync_deep_dive.py** for ibverbs internals,
+    memory registration benchmarks, and full implementations. This notebook focuses on
+    the concepts and patterns you need to know for async RL.
     """)
     return
 
@@ -75,52 +88,19 @@ def _(mo):
 
     ### The Scale Problem
 
-    For LLM-based RL, the weights are **massive**. Let's calculate:
-    """)
-    return
+    For LLM-based RL, the weights are **massive**. Back-of-envelope math
+    (1 parameter ≈ 2 bytes in bf16):
 
+    | Model | Weight Size |
+    |-------|-------------|
+    | Llama 3.1 70B | ~140 GB |
+    | Llama 3.1 405B | ~810 GB |
+    | DeepSeek V3 671B | ~1.3 TB |
 
-@app.cell
-def _(mo):
-    # Calculate model sizes
-    _models = [
-        ("Llama 3.2 3B", 3),
-        ("Qwen 2.5 7B", 7),
-        ("Llama 3.1 70B", 70),
-        ("Llama 3.1 405B", 405),
-        ("DeepSeek V3 671B", 671),
-    ]
-
-    print("Model Weight Sizes (bf16 precision):\n")
-    print(f"{'Model':<20} {'Weight Size'}")
-    print("-" * 35)
-
-    for _name, _params_b in _models:
-        _size_gb = _params_b * 2  # bf16 = 2 bytes per param
-
-        if _size_gb >= 1000:
-            _size_str = f"{_size_gb/1000:.1f} TB"
-        else:
-            _size_str = f"{_size_gb:.0f} GB"
-
-        print(f"{_name:<20} {_size_str}")
-
-    print("\n→ These weights need to move from trainer → generators")
-    print("→ For large models, this means crossing the network fabric")
-
-    mo.md(r"""
-    ### Why This Forces Cross-Node Transfer
-
-    The numbers speak for themselves:
-
-    - A **70B model** has 140 GB of weights
-    - A **405B model** has 810 GB of weights
-    - **DeepSeek V3** has 1.3 TB of weights
-
-    These models are sharded across many GPUs, often spanning multiple nodes.
-    Weight sync can't rely on NVLink alone - it must cross InfiniBand/RoCE.
-
-    This is why we need RDMA.
+    These weights need to move from trainer → generators regularly. If we're
+    not careful, our "async RL training workload" just becomes a weight syncing
+    workload. Let's look at the bandwidth hierarchy to understand why this is
+    tricky and what we can do about it.
     """)
     return
 
@@ -187,65 +167,79 @@ def _(mo):
     └──────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 
     Bandwidth encoding (line intensity):
-      ########  NVLink/NVSwitch   900 GB/s   (GPU ↔ GPU, same node)
-      ========  PCIe Gen5 / IB     50-64 GB/s (CPU↔GPU, CPU↔NIC, cross-node)
-      --------  CPU interconnect   48 GB/s   (CPU ↔ CPU, same node)
+      ########  NVLink/NVSwitch   900 GB/s bidirectional (GPU ↔ GPU, same node)
+      ========  PCIe Gen5 / RDMA  50-64 GB/s unidirectional (CPU↔GPU, CPU↔NIC, cross-node)
+      --------  CPU interconnect  48 GB/s (CPU ↔ CPU, same node)
     ```
 
-    RDMA can transfer between any registered memory (CPU or GPU) via the NICs.
+    ### A Note on Bandwidth Numbers
 
-    | Interconnect | Bandwidth | Latency | Use Case |
-    |--------------|-----------|---------|----------|
-    | **NVLink/NVSwitch** | 900 GB/s | ~1 μs | Same-node GPU↔GPU |
-    | **InfiniBand NDR400** | 50 GB/s | ~1-2 μs | Cross-node RDMA |
-    | **PCIe Gen5 x16** | 64 GB/s | ~1-2 μs | CPU↔GPU, CPU↔NIC |
-    | **CPU interconnect** | 48 GB/s | ~100 ns | CPU↔CPU (same node) |
+    Bandwidth specs vary by hardware generation, cluster configuration, and vendor.
+    We'll use numbers from Meta's published Llama 3 training infrastructure
+    ([Building Meta's GenAI Infrastructure](https://engineering.fb.com/2024/03/12/data-center-engineering/building-metas-genai-infrastructure/)):
+
+    > "Both of these solutions interconnect **400 Gbps endpoints**... we have successfully
+    > used both RoCE and InfiniBand clusters for large, GenAI workloads (including our
+    > ongoing training of Llama 3 on our RoCE cluster) without any network bottlenecks."
+
+    **Important**: "400 Gbps" in networking is **full-duplex** - meaning 400 Gbps transmit
+    AND 400 Gbps receive simultaneously. For weight sync (unidirectional: trainer → generator),
+    we get the full 400 Gbps = **50 GB/s per NIC**.
+
+    Meta's Grand Teton nodes have **8 RDMA NICs** (one per GPU, 1:1 mapping), giving
+    400 GB/s aggregate unidirectional bandwidth per node. For more details on Grand Teton
+    and Monarch's RDMA architecture, see the SIGCOMM 2024 paper:
+    [RDMA over Ethernet for Distributed AI Training at Meta Scale](https://cs.stanford.edu/~keithw/sigcomm2024/sigcomm24-final246-acmpaginated.pdf).
+
+    | Interconnect | Bandwidth | Notes |
+    |--------------|-----------|-------|
+    | **NVLink 4.0** | 900 GB/s bidirectional | ~450 GB/s per direction |
+    | **RDMA (IB/RoCE)** | 400 Gbps = 50 GB/s | Per NIC, full-duplex |
+    | **PCIe Gen5 x16** | 64 GB/s | Per direction |
 
     **Key observations:**
 
-    1. **NVLink dominates** - 900 GB/s is ~18x faster than cross-node RDMA. Same-node GPU↔GPU
-       communication is nearly free compared to crossing the network.
+    1. **NVLink dominates** - 450 GB/s unidirectional is ~9x faster than a single NIC
+    2. **Multi-NIC scales** - 8 NICs × 50 GB/s = 400 GB/s, approaching NVLink speeds
 
-    2. **RDMA >> Ethernet** - InfiniBand/RoCE at 50 GB/s is ~4x faster than 100GbE (12.5 GB/s),
-       plus kernel bypass and lower latency. Worth the complexity for HPC workloads.
+    **Rule of thumb**: Keep frequent operations on NVLink (gradients, activations).
+    Use RDMA for cross-node communication (weight sync).
 
-    3. **PCIe is faster than you'd think** - At 64 GB/s, CPU↔GPU transfers aren't the bottleneck
-       people often assume. The real cost is synchronization, not bandwidth.
+    ### Back-of-Envelope: Syncing Large Models
 
-    **Rule of thumb**: Place the most bandwidth-intensive, frequent operations on NVLink
-    (gradients, activations). Use RDMA for cross-node communication (weight sync, sharding).
-    PCIe is fine for occasional CPU↔GPU transfers.
+    Let's do some quick math. DeepSeek V3 has 671B parameters (~1.34 TB in bf16).
 
-    We'll focus primarily on **NVLink** and **RDMA** for this notebook. Most people use these
-    via **collectives**, exposed through PyTorch distributed:
+    The key insight: **you're not shoving 1.3 TB through a single NIC**. The weights
+    are distributed across many GPUs (via some combination of PP, EP, TP, FSDP),
+    and each GPU has its own NIC. You get **aggregate bandwidth** across all NICs.
 
-    ```python
-    import torch.distributed as dist
+    The actual sync time depends on **both sides**:
+    - **Trainer's aggregate upload bandwidth** (sending weights out)
+    - **Generator's aggregate download bandwidth** (receiving weights)
 
-    # Initialize process group - NCCL uses NVLink (same-node) and RDMA (cross-node)
-    dist.init_process_group(backend="nccl")
+    The bottleneck is whichever is smaller. And if multiple generators pull from
+    the same trainer simultaneously, the trainer's bandwidth is divided among them.
 
-    # All-reduce: average gradients across all GPUs
-    dist.all_reduce(gradients, op=dist.ReduceOp.SUM)
-    gradients /= world_size
+    With Grand Teton's 8 NICs per node at 50 GB/s each (400 GB/s per node),
+    the math is simple: **Time = Shard Size / Bandwidth**.
 
-    # All-gather: collect tensors from all ranks
-    gathered = [torch.empty_like(tensor) for _ in range(world_size)]
-    dist.all_gather(gathered, tensor)
+    The per-node shard size depends on how many nodes the model is spread across:
+    - DeepSeek V3 (1.3 TB) across 8 nodes → ~160 GB per node
+    - DeepSeek V3 (1.3 TB) across 16 nodes → ~80 GB per node
 
-    # Broadcast: send from rank 0 to all others
-    dist.broadcast(weights, src=0)
-    ```
+    | Per-node shard | Time to sync |
+    |----------------|--------------|
+    | ~160 GB (8 nodes) | 160 / 400 = **0.4 seconds** |
+    | ~80 GB (16 nodes) | 80 / 400 = **0.2 seconds** |
 
-    This works great for training. But for RL weight sync, we need something different...
+    The exact per-node shard size depends on your parallelism strategy (PP, EP, TP, etc.),
+    but the math works out: with modern RDMA hardware, you can sync even the largest
+    models in **sub-second time**.
+
+    Compare this to naive TCP: kernel copies, socket overhead, no zero-copy...
+    easily 10x slower. **RDMA is the only way to make async RL practical at scale.**
     """)
     return
-
-
-@app.cell
-def _():
-    import torch
-    return (torch,)
 
 
 @app.cell
@@ -253,8 +247,17 @@ def _(mo):
     mo.md(r"""
     ## 3. The Problem: Collectives Are Blocking
 
-    Collectives work great for training - everyone computes gradients, then synchronizes.
-    But async RL has a different access pattern.
+    Most people use RDMA via **collectives** through PyTorch distributed:
+
+    ```python
+    import torch.distributed as dist
+
+    dist.init_process_group(backend="nccl")
+    dist.all_reduce(gradients, op=dist.ReduceOp.SUM)
+    dist.broadcast(weights, src=0)
+    ```
+
+    This works great for training. But async RL has a different access pattern.
 
     ### High Variance in Generation Times
 
@@ -272,23 +275,6 @@ def _(mo):
                               all_gather(weights)  # Everyone waits!
     ```
 
-    ### What About send/recv?
-
-    PyTorch distributed does have point-to-point primitives:
-
-    ```python
-    # Sender side
-    dist.send(tensor, dst=receiver_rank)
-
-    # Receiver side
-    dist.recv(tensor, src=sender_rank)
-    ```
-
-    But this is **two-sided** - both sender and receiver must coordinate:
-    - Receiver must call `recv()` before sender's `send()` completes
-    - Trainer would need to wait until generators are ready to receive
-    - Still blocking on coordination!
-
     ### The One-Sided Solution: RDMA
 
     What if the sender could write directly to the receiver's memory without coordination?
@@ -305,6 +291,7 @@ def _(mo):
     ```
 
     This is what RDMA enables: **one-sided memory operations**.
+    The trainer doesn't even know when generators pull weights - this is truly async!
     """)
     return
 
@@ -312,178 +299,12 @@ def _(mo):
 @app.cell
 def _(mo):
     mo.md(r"""
-    ## 4. How RDMA Works (ibverbs)
+    ## 4. The Magic Pointer Pattern
 
-    RDMA (Remote Direct Memory Access) lets one machine read/write another machine's memory
-    directly, bypassing the kernel and CPU on both sides.
+    One natural question that arises is along the lines of, "How do we actually represent one-sided puts/gets if not with NCCL collectives?"
 
-    ### The ibverbs Stack
-
-    ```
-    ┌─────────────────────────────────────────────────────────┐
-    │  Application (PyTorch, Monarch, etc.)                   │
-    ├─────────────────────────────────────────────────────────┤
-    │  libibverbs  (userspace RDMA API)                       │
-    ├─────────────────────────────────────────────────────────┤
-    │  Provider driver (mlx5, efa, rxe, etc.)                 │
-    ├─────────────────────────────────────────────────────────┤
-    │  Hardware (InfiniBand NIC, RoCE NIC, etc.)              │
-    └─────────────────────────────────────────────────────────┘
-    ```
-
-    We'll focus on **InfiniBand** and **RoCE** (RDMA over Converged Ethernet).
-    Other transports like AWS EFA exist but we won't cover them here.
-
-    ### Key RDMA Operations
-
-    | Operation | Description |
-    |-----------|-------------|
-    | `RDMA_WRITE` | Write to remote memory (one-sided) |
-    | `RDMA_READ` | Read from remote memory (one-sided) |
-    | `SEND/RECV` | Two-sided messaging (like TCP) |
-
-    The magic is in `RDMA_WRITE` and `RDMA_READ` - they're **one-sided**:
-    - Remote CPU is not involved
-    - Remote application doesn't need to call anything
-    - NIC handles everything in hardware
-
-    ### Memory Registration
-
-    Before RDMA, memory must be **registered** with the NIC:
-
-    ```python
-    # Conceptually (actual ibverbs API is in C)
-    mr = rdma_register_memory(buffer, size)
-    # Returns:
-    #   - lkey: local access key (for local operations)
-    #   - rkey: remote access key (share with remote peer)
-    #   - addr: physical/virtual address
-    ```
-
-    The `(addr, rkey)` pair is a **remote-accessible pointer**. Share it with a peer,
-    and they can read/write your memory directly.
-
-    ### Queue Pair Setup
-
-    Before any RDMA operations, you need to establish a **Queue Pair (QP)** between
-    sender and receiver. This is a one-time connection setup:
-
-    ```
-    ┌─────────────┐                           ┌─────────────┐
-    │   Sender    │                           │  Receiver   │
-    │             │                           │             │
-    │  Create QP  │ ─── exchange QP info ───► │  Create QP  │
-    │  (qp_num,   │ ◄── (qp_num, lid, gid) ── │             │
-    │   lid, gid) │                           │             │
-    │             │                           │             │
-    │  Move QP to │                           │  Move QP to │
-    │  RTR → RTS  │                           │  RTR → RTS  │
-    │             │                           │             │
-    │  Now ready  │ ═══ RDMA operations ════► │  Now ready  │
-    │  for RDMA!  │                           │  for RDMA!  │
-    └─────────────┘                           └─────────────┘
-    ```
-
-    This is where **Monarch actors** shine. Because you can spawn arbitrary actors,
-    you can create **RDMA Manager actors** that:
-    - Initialize QPs on their respective hosts
-    - Exchange QP info via actor messages
-    - Manage the connection lifecycle
-
-    ```python
-    # Monarch pattern: RDMA managers as actors
-    class RDMAManager(Actor):
-        def __init__(self):
-            self.qp = create_queue_pair()
-            self.qp_info = get_qp_info(self.qp)  # (qp_num, lid, gid)
-
-        @endpoint
-        def get_qp_info(self) -> QpInfo:
-            return self.qp_info
-
-        @endpoint
-        def connect(self, remote_qp_info: QpInfo):
-            # Transition QP: INIT → RTR → RTS
-            connect_qp(self.qp, remote_qp_info)
-
-    # Setup: exchange QP info via actor messages, then RDMA is ready
-    trainer_info = trainer_rdma.get_qp_info.call_one().get()
-    generator_rdma.connect.call_one(trainer_info).get()
-    ```
-
-    The actor abstraction makes RDMA connection management natural and composable.
-
-    ### Monarch Using Monarch: RdmaController
-
-    Here's the cool part: **Monarch uses itself** to manage RDMA infrastructure. Looking at
-    the actual Python code in `monarch/_src/rdma/rdma.py`:
-
-    ```python
-    # From Monarch's RDMA implementation
-    from monarch._src.actor.proc_mesh import get_or_spawn_controller
-
-    class RdmaController(Actor):
-        '''Singleton controller that coordinates RDMA initialization.'''
-
-        def __init__(self):
-            # Track which proc meshes have RDMA initialized
-            self._manager_futures: dict[ProcMesh, Future[RdmaManager]] = {}
-
-        @endpoint
-        async def init_rdma_on_mesh(self, proc_mesh: ProcMesh) -> None:
-            '''Lazily initialize RDMA on a proc mesh.'''
-            if proc_mesh not in self._manager_futures:
-                self._manager_futures[proc_mesh] = Future(
-                    coro=RdmaManager.create(proc_mesh)
-                )
-            await self._manager_futures[proc_mesh]
-
-    # Cached initialization - only runs once per process
-    @functools.cache
-    def _ensure_init_rdma_manager():
-        async def task():
-            controller = await get_or_spawn_controller("rdma_controller", RdmaController)
-            await controller.init_rdma_on_mesh.call_one(current_proc_mesh())
-        return spawn_task(task())
-    ```
-
-    This is **Monarch building Monarch** - the RDMA subsystem uses the same patterns:
-
-    - `get_or_spawn_controller("rdma_controller", RdmaController)` ensures one global controller
-    - The controller lazily initializes RDMA managers per proc mesh
-    - `@functools.cache` ensures we only bootstrap once per process
-    - Under the hood, the actual RDMA operations are in Rust (`RdmaManagerActor`)
-
-    It's actors all the way down.
-
-    ### Why This Matters for Weight Sync
-
-    Remember: CPU memory AND GPU memory can both be registered for RDMA.
-
-    ```
-    Trainer:
-      1. Register weight buffer with RDMA NIC
-      2. Get (addr, rkey) handle
-      3. Share handle with generators (tiny message)
-
-    Generator:
-      1. Receive handle
-      2. RDMA_READ directly from trainer's memory
-      3. No coordination with trainer needed!
-    ```
-
-    The trainer doesn't even know when generators pull weights. True one-sided.
-    """)
-    return
-
-
-@app.cell
-def _(mo):
-    mo.md(r"""
-    ## 5. The Magic Pointer Pattern
-
-    Now here's the key insight from our RDMA discussion: to represent remote data,
-    we only need a **tiny handle** - the `(addr, rkey, size)` tuple.
+    Here's a key insight: to represent remote data, we only need a **tiny handle** -
+    an `(addr, rkey, size)` tuple that says "here's where my data lives."
 
     Monarch wraps this in `RDMABuffer`. Let's see how small it actually is:
     """)
@@ -491,29 +312,11 @@ def _(mo):
 
 
 @app.cell
-def _():
-    # Central imports for all RDMA examples in this notebook
-    import time
-    from monarch.actor import Actor, endpoint, this_host, current_rank
-    from monarch.rdma import RDMABuffer, RDMAAction, is_rdma_available
-    return (
-        Actor,
-        RDMAAction,
-        RDMABuffer,
-        current_rank,
-        endpoint,
-        is_rdma_available,
-        this_host,
-        time,
-    )
-
-
-@app.cell
 def _(Actor, RDMABuffer, endpoint, is_rdma_available, this_host, torch):
     # Measure actual size of RDMABuffer handles
     import pickle
 
-    def show_fallback():
+    def show_fallback_sizes():
         """Fallback: show expected sizes based on RDMABuffer structure."""
         print("(RDMA not available - showing expected handle sizes)\n")
         print("RDMABuffer contains: addr (8B) + rkey (4B) + size (8B) + owner (~100B)")
@@ -530,7 +333,7 @@ def _(Actor, RDMABuffer, endpoint, is_rdma_available, this_host, torch):
 
     try:
         if not is_rdma_available():
-            show_fallback()
+            show_fallback_sizes()
         else:
             class BufferSizeDemo(Actor):
                 """Actor that creates RDMABuffers and measures their size."""
@@ -557,8 +360,7 @@ def _(Actor, RDMABuffer, endpoint, is_rdma_available, this_host, torch):
 
                     return results
 
-            host = this_host()
-            proc = host.spawn_procs({"procs": 1})
+            proc = this_host().spawn_procs(per_host={"procs": 1})
             demo = proc.spawn("buffer_demo", BufferSizeDemo)
 
             results = demo.measure_buffer_sizes.call_one().get()
@@ -575,7 +377,7 @@ def _(Actor, RDMABuffer, endpoint, is_rdma_available, this_host, torch):
 
     except Exception as e:
         print(f"(RDMA setup failed: {e})\n")
-        show_fallback()
+        show_fallback_sizes()
     return
 
 
@@ -611,8 +413,6 @@ def _(mo):
 
     ### RDMABuffer in Action
 
-    From `monarch.rdma`:
-
     ```python
     from monarch.rdma import RDMABuffer
 
@@ -621,7 +421,6 @@ def _(mo):
     buffer = RDMABuffer(weights.view(torch.uint8).flatten())
 
     # Return buffer as part of an endpoint response
-    # This is a TINY message - just the handle!
     @endpoint
     def get_weight_handle(self) -> RDMABuffer:
         return self.buffer
@@ -632,9 +431,9 @@ def _(mo):
     handle.read_into(gpu_weights).get()                   # Bulk RDMA → GPU
     ```
 
-    See the [GRPO Actor example](https://meta-pytorch.org/monarch/generated/examples/grpo_actor.html)
-    for a minimal implementation showing RDMA data flow. We'll build a more complete
-    version in the following sections.
+    **Want to understand how RDMA works under the hood?** Check out **06b_weight_sync_deep_dive.py**
+    for ibverbs internals, queue pair setup, and why Monarch's actor model is such a natural fit
+    for managing RDMA connections. It's actors all the way down!
     """)
     return
 
@@ -642,387 +441,97 @@ def _(mo):
 @app.cell
 def _(mo):
     mo.md(r"""
-    ### The Cost of Memory Registration
+    ### Live Demo: Trainer → Generator Weight Sync
 
-    RDMA memory registration is **expensive**:
-    - Pins physical pages (prevents swapping)
-    - Creates IOMMU/DMA mappings in the NIC
-    - Can take milliseconds for large buffers
-
-    But here's the good news: **Monarch caches all memory region registrations.** Once a buffer
-    is registered, subsequent uses hit the cache, making it essentially free in steady state.
-
-    Let's see this in action with 3 approaches:
+    Let's see this in action with a simple example. A trainer holds weights,
+    a generator pulls them via RDMA.
     """)
+    return
+
+
+@app.cell
+def _(Actor, RDMABuffer, endpoint, is_rdma_available, this_host, torch):
+    # Simple trainer → generator weight sync demo
+
+    def show_fallback_demo():
+        """Show what would happen with RDMA."""
+        print("(RDMA not available - showing conceptual flow)\n")
+        print("1. Trainer creates weights (e.g., 4 MB tensor)")
+        print("2. Trainer wraps weights in RDMABuffer → tiny handle (~150 bytes)")
+        print("3. Trainer sends handle to Generator via actor message")
+        print("4. Generator calls handle.read_into(local_buffer)")
+        print("5. RDMA hardware transfers 4 MB directly, trainer not involved!")
+        print("\n→ Zero-copy, one-sided, no serialization overhead")
+
+    try:
+        if not is_rdma_available():
+            show_fallback_demo()
+        else:
+            class SimpleTrainer(Actor):
+                """Trainer that holds weights and exposes an RDMA handle."""
+
+                def __init__(self, weight_size: int):
+                    # Simulate model weights
+                    self.weights = torch.randn(weight_size, dtype=torch.float32)
+                    # Register with RDMA
+                    self.weight_bytes = self.weights.view(torch.uint8).flatten()
+                    self.buffer = RDMABuffer(self.weight_bytes)
+                    print(f"[Trainer] Created weights: {self.weights.numel() * 4 / 1e6:.1f} MB")
+
+                @endpoint
+                def get_weight_handle(self) -> RDMABuffer:
+                    """Return tiny handle (not the weights themselves!)"""
+                    return self.buffer
+
+                @endpoint
+                def get_checksum(self) -> float:
+                    """For verification: sum of weights"""
+                    return float(self.weights.sum())
+
+            class SimpleGenerator(Actor):
+                """Generator that pulls weights from trainer."""
+
+                def __init__(self, weight_size: int):
+                    # Pre-allocate space for weights
+                    self.weights = torch.zeros(weight_size, dtype=torch.float32)
+                    self.weight_bytes = self.weights.view(torch.uint8).flatten()
+                    print(f"[Generator] Allocated buffer: {self.weights.numel() * 4 / 1e6:.1f} MB")
+
+                @endpoint
+                def pull_weights(self, handle: RDMABuffer) -> float:
+                    """Pull weights via RDMA read, return checksum for verification."""
+                    # This is the magic: RDMA read directly into our buffer
+                    handle.read_into(self.weight_bytes).get()
+                    return float(self.weights.sum())
+
+            # Spawn trainer and generator
+            _procs = this_host().spawn_procs(per_host={"procs": 2})
+
+            _trainer = _procs.slice(procs=0).spawn("trainer", SimpleTrainer, 1024 * 1024)  # 4 MB
+            _generator = _procs.slice(procs=1).spawn("generator", SimpleGenerator, 1024 * 1024)
+
+            # Step 1: Get handle from trainer (tiny message!)
+            _handle = _trainer.get_weight_handle.call_one().get()
+            print(f"\n[Orchestrator] Got handle from trainer")
+
+            # Step 2: Send handle to generator, have it pull weights
+            _gen_checksum = _generator.pull_weights.call_one(_handle).get()
+            _trainer_checksum = _trainer.get_checksum.call_one().get()
+
+            print(f"[Orchestrator] Trainer checksum: {_trainer_checksum:.2f}")
+            print(f"[Orchestrator] Generator checksum: {_gen_checksum:.2f}")
+            print(f"[Orchestrator] Match: {abs(_trainer_checksum - _gen_checksum) < 0.01}")
+
+    except Exception as e:
+        print(f"(Demo failed: {e})\n")
+        show_fallback_demo()
     return
 
 
 @app.cell
 def _(mo):
     mo.md(r"""
-    #### Approach 1: Naive
-
-    Create new RDMABuffer on each transfer - registration happens on first use:
-    """)
-    return
-
-
-@app.cell
-def _(Actor, RDMABuffer, current_rank, endpoint, time, torch):
-    class NaiveSender(Actor):
-        """Creates new RDMABuffer handles every transfer. Expensive!"""
-
-        def __init__(self, layer_sizes: list):
-            self.layer_sizes = layer_sizes
-            self.layers = [torch.zeros(size, dtype=torch.float32) for size in layer_sizes]
-            for i, layer in enumerate(self.layers):
-                layer.fill_(float(i + 1))
-
-        @endpoint
-        def get_fresh_handles(self) -> list:
-            handles = []
-            for size, layer in zip(self.layer_sizes, self.layers):
-                byte_view = layer.view(torch.uint8).flatten()
-                handles.append((size, RDMABuffer(byte_view)))
-            return handles
-
-
-    class NaiveReceiver(Actor):
-        """Receives from naive sender - pays MR cost every step."""
-
-        def __init__(self, layer_sizes: list):
-            self.layer_sizes = layer_sizes
-            self.layers = [torch.zeros(size, dtype=torch.float32) for size in layer_sizes]
-            self.rank = current_rank().rank
-
-        @endpoint
-        def receive_step(self, sender: NaiveSender) -> dict:
-            start = time.perf_counter()
-            handles = sender.get_fresh_handles.call_one().get()
-            for i, (size, handle) in enumerate(handles):
-                byte_view = self.layers[i].view(torch.uint8).flatten()
-                handle.read_into(byte_view).get()
-            elapsed_ms = (time.perf_counter() - start) * 1000
-            return {"elapsed_ms": elapsed_ms}
-
-    print("NaiveSender: Re-registers all parameters on every call")
-    return NaiveReceiver, NaiveSender
-
-
-@app.cell
-def _(mo):
-    mo.md(r"""
-    #### Approach 2: Contiguous Buffer
-
-    Allocate one buffer, register at init time:
-    """)
-    return
-
-
-@app.cell
-def _(Actor, RDMABuffer, current_rank, endpoint, time, torch):
-    class ContiguousSender(Actor):
-        """One buffer, one MR, registered at startup."""
-
-        def __init__(self, layer_sizes: list):
-            self.layer_sizes = layer_sizes
-            total_size = sum(layer_sizes)
-
-            # One contiguous buffer
-            self.buffer = torch.zeros(total_size, dtype=torch.float32)
-            offset = 0
-            for i, size in enumerate(layer_sizes):
-                self.buffer[offset : offset + size].fill_(float(i + 1))
-                offset += size
-
-            # Register ONCE at startup
-            byte_view = self.buffer.view(torch.uint8).flatten()
-            self.handle = RDMABuffer(byte_view)
-
-        @endpoint
-        def get_handle(self) -> tuple:
-            return (len(self.buffer), self.handle)  # Same handle every time!
-
-
-    class ContiguousReceiver(Actor):
-        """Receives from contiguous sender - fast after first step."""
-
-        def __init__(self, total_size: int):
-            self.buffer = torch.zeros(total_size, dtype=torch.float32)
-            self.rank = current_rank().rank
-
-        @endpoint
-        def receive_step(self, sender: ContiguousSender) -> dict:
-            start = time.perf_counter()
-            size, handle = sender.get_handle.call_one().get()
-            byte_view = self.buffer.view(torch.uint8).flatten()
-            handle.read_into(byte_view).get()
-            elapsed_ms = (time.perf_counter() - start) * 1000
-            return {"elapsed_ms": elapsed_ms}
-
-    print("ContiguousSender: Registers once, reuses same handle")
-    return ContiguousReceiver, ContiguousSender
-
-
-@app.cell
-def _(mo):
-    mo.md(r"""
-    #### Approach 3: Scattered + RDMAAction
-
-    Register each buffer at init, build transfer plan once via handshake:
-
-
-    **What is RDMAAction?**
-
-    Think of `RDMAAction` as a **transfer plan**. You
-    describe all the reads/writes you want
-    to do, then `submit()` executes the whole plan at once:
-
-    ```python
-    # Build the plan once
-    action = RDMAAction()
-    action.read_into(handle1, local_buffer1)
-    action.read_into(handle2, local_buffer2)
-    action.read_into(handle3, local_buffer3)
-
-    # Execute whenever you want - just one call
-    action.submit().get()
-    ```
-
-    This is useful when you have many scattered buffers (like model parameters) and want to batch them into a single logical operation.
-    """)
-    return
-
-
-@app.cell
-def _(Actor, RDMAAction, RDMABuffer, current_rank, endpoint, time, torch):
-    class ScatteredSender(Actor):
-        """Multiple buffers, each registered once at startup."""
-
-        def __init__(self, layer_sizes: list):
-            self.layer_sizes = layer_sizes
-            self.layers = []
-            self.handles = []
-
-            for i, size in enumerate(layer_sizes):
-                layer = torch.zeros(size, dtype=torch.float32)
-                layer.fill_(float(i + 1))
-                self.layers.append(layer)
-                # Register ONCE at startup
-                byte_view = layer.view(torch.uint8).flatten()
-                self.handles.append(RDMABuffer(byte_view))
-
-        @endpoint
-        def get_handles(self) -> list:
-            return [(size, handle) for size, handle in zip(self.layer_sizes, self.handles)]
-
-    class ScatteredReceiver(Actor):
-        """Receives from scattered sender with RDMAAction batching."""
-
-        def __init__(self, layer_sizes: list):
-            self.layer_sizes = layer_sizes
-            self.layers = [torch.zeros(size, dtype=torch.float32) for size in layer_sizes]
-            self.rank = current_rank().rank
-            self.action = None  # Built on handshake
-
-        @endpoint
-        def handshake(self, sender: ScatteredSender):
-            """Call once to build the RDMAAction transfer plan."""
-            handles = sender.get_handles.call_one().get()
-            self.action = RDMAAction()
-            for i, (size, handle) in enumerate(handles):
-                byte_view = self.layers[i].view(torch.uint8).flatten()
-                self.action.read_into(handle, byte_view)
-            return "Transfer plan ready"
-
-        @endpoint
-        def receive_step(self) -> dict:
-            """Execute the cached transfer plan."""
-            start = time.perf_counter()
-            self.action.submit().get()
-            elapsed_ms = (time.perf_counter() - start) * 1000
-            return {"elapsed_ms": elapsed_ms}
-
-    print("ScatteredSender: Registers each layer once")
-    print("ScatteredReceiver: handshake() builds plan, receive_step() executes it")
-    return ScatteredReceiver, ScatteredSender
-
-
-@app.cell
-def _(mo):
-    mo.md(r"""
-    **Pattern recap:**
-
-    - **Naive**: Create RDMABuffer in the transfer endpoint
-    - **Contiguous**: Register one big buffer in `__init__`
-    - **Scattered + RDMAAction**: Register multiple buffers in `__init__`, build transfer plan in `handshake()`
-
-    Let's benchmark to see the difference:
-    """)
-    return
-
-
-@app.cell
-def _(
-    ContiguousReceiver,
-    ContiguousSender,
-    NaiveReceiver,
-    NaiveSender,
-    ScatteredReceiver,
-    ScatteredSender,
-    this_host,
-):
-    def run_benchmark():
-        """Compare the three approaches over multiple steps."""
-        layer_sizes = [1000, 5000, 2000]  # 8000 floats total
-        total_size = sum(layer_sizes)
-        num_steps = 5
-
-        host = this_host()
-        sender_procs = host.spawn_procs({"procs": 1})
-        receiver_procs = host.spawn_procs({"procs": 1})
-
-        print("=== RDMA Registration Benchmark ===")
-        print(f"Transferring {total_size} floats ({total_size * 4 / 1024:.1f} KB) x {num_steps} steps\n")
-
-        results = {}
-
-        # Naive approach
-        naive_sender = sender_procs.spawn("naive_s", NaiveSender, layer_sizes)
-        naive_receiver = receiver_procs.spawn("naive_r", NaiveReceiver, layer_sizes)
-        times = []
-        for step in range(num_steps):
-            r = naive_receiver.receive_step.call_one(naive_sender).get()
-            times.append(r["elapsed_ms"])
-        results["Naive"] = times
-        print(f"Naive (re-register each step):")
-        for i, t in enumerate(times):
-            print(f"  Step {i+1}: {t:.2f}ms")
-        print(f"  Average: {sum(times)/len(times):.2f}ms\n")
-
-        # Contiguous approach
-        cont_sender = sender_procs.spawn("cont_s", ContiguousSender, layer_sizes)
-        cont_receiver = receiver_procs.spawn("cont_r", ContiguousReceiver, total_size)
-        times = []
-        for step in range(num_steps):
-            r = cont_receiver.receive_step.call_one(cont_sender).get()
-            times.append(r["elapsed_ms"])
-        results["Contiguous"] = times
-        print(f"Contiguous (register once):")
-        for i, t in enumerate(times):
-            print(f"  Step {i+1}: {t:.2f}ms")
-        print(f"  Average: {sum(times)/len(times):.2f}ms\n")
-
-        # Scattered + RDMAAction approach
-        scat_sender = sender_procs.spawn("scat_s", ScatteredSender, layer_sizes)
-        scat_receiver = receiver_procs.spawn("scat_r", ScatteredReceiver, layer_sizes)
-        scat_receiver.handshake.call_one(scat_sender).get()  # Build transfer plan once
-        times = []
-        for step in range(num_steps):
-            r = scat_receiver.receive_step.call_one().get()  # Just execute cached plan
-            times.append(r["elapsed_ms"])
-        results["Scattered"] = times
-        print(f"Scattered + RDMAAction (register once, batch):")
-        for i, t in enumerate(times):
-            print(f"  Step {i+1}: {t:.2f}ms")
-        print(f"  Average: {sum(times)/len(times):.2f}ms\n")
-
-        print("=== What's Happening ===")
-        print("Naive step 1: Cold MR registration (~2000ms)")
-        print("Naive steps 2+: Cache hit, MR already registered (~10ms)")
-        print("Contiguous/Scattered: Registration happened at spawn time, not during benchmark")
-
-        return results
-
-    benchmark_results = run_benchmark()
-    return
-
-
-@app.cell
-def _(mo):
-    mo.md(r"""
-    **What the benchmark shows:**
-
-    - **Naive**: First call is ~2000ms (cold registration), subsequent calls ~10ms (cache hit)
-    - **Contiguous/Scattered**: All calls are fast (~4-9ms) because registration happened
-      at spawn time, before the timing loop started
-
-    *Note: RDMAAction (~9ms) is slower than Contiguous (~4ms) due to Python overhead.
-    Moving the batching logic to Rust is a planned optimization.*
-    """)
-    return
-
-
-@app.cell
-def _(mo):
-    mo.md(r"""
-    ### Two Weight Sync Patterns
-
-    With RDMABuffer as our building block, there are two main approaches:
-
-    | Pattern | How it works | Trade-offs |
-    |---------|--------------|------------|
-    | **CPU Staging** | GPU → CPU buffer → RDMA → CPU → GPU | One MR, simple, but copies |
-    | **Direct GPU** | GPU → RDMA → GPU (GPUDirect) | No copies, but one MR per param |
-
-    **Pattern 1: CPU Staging (Contiguous Buffer)**
-
-    Pack all parameters into one contiguous CPU buffer, register once:
-
-    ```python
-    class Trainer(Actor):
-        def __init__(self):
-            # Calculate total size for all parameters
-            total_bytes = sum(p.numel() * p.element_size() for p in model.parameters())
-
-            # Allocate ONE contiguous buffer, register ONCE
-            self.staging_buffer = torch.empty(total_bytes, dtype=torch.uint8)
-            self.handle = RDMABuffer(self.staging_buffer)
-
-            # Track where each param lives in the buffer
-            self.param_offsets = compute_offsets(model)
-
-        def pack_weights(self):
-            '''Copy all params into contiguous buffer.'''
-            for name, param in model.named_parameters():
-                offset = self.param_offsets[name]
-                self.staging_buffer[offset:offset+size].copy_(param.view(torch.uint8))
-
-        @endpoint
-        def get_weight_handle(self) -> RDMABuffer:
-            self.pack_weights()
-            return self.handle  # Same handle, new data
-    ```
-
-    **Pattern 2: Direct GPU MRs**
-
-    Register each GPU parameter directly, no CPU copies:
-
-    ```python
-    class Trainer(Actor):
-        def __init__(self):
-            # Register each param ONCE at startup
-            self.handles = {}
-            for name, param in model.named_parameters():
-                byte_view = param.data.view(torch.uint8).flatten()
-                self.handles[name] = RDMABuffer(byte_view)
-
-        @endpoint
-        def get_param_handles(self) -> dict[str, RDMABuffer]:
-            # Handles are reused - data updates in place
-            return self.handles
-    ```
-
-    Both patterns amortize MR registration cost across training iterations.
-    Let's look at CPU staging in more detail (it's more common in async RL).
-    """)
-    return
-
-
-@app.cell
-def _(mo):
-    mo.md(r"""
-    ## 6. CPU Staging Pattern
+    ## 5. CPU Staging Pattern
 
     ### GPU-Native RDMA Works!
 
@@ -1062,44 +571,9 @@ def _(mo):
 
 
 @app.cell
-def _(torch):
-    def demonstrate_cpu_staging():
-        """Demonstrate the CPU staging pattern."""
-        if not torch.cuda.is_available():
-            print("CUDA not available - showing conceptual flow")
-            return
-
-        # Trainer side: GPU weights → CPU staging buffer (RDMA registered)
-        trainer_weights = torch.randn(1000, 1000, device="cuda:0")
-
-        # Pin memory for efficient transfers and RDMA registration
-        cpu_staging = torch.empty_like(trainer_weights, device="cpu").pin_memory()
-
-        # D2H: Trainer dumps to CPU (async, non-blocking for trainer)
-        cpu_staging.copy_(trainer_weights, non_blocking=True)
-        torch.cuda.synchronize()  # Just for timing demo
-
-        print("Trainer: Weights copied to CPU staging buffer (RDMA registered)")
-        print(f"  GPU memory: {trainer_weights.device}")
-        print(f"  CPU staging: pinned={cpu_staging.is_pinned()}")
-
-        # Generator side: RDMA pulls from trainer's CPU → directly to generator's GPU
-        # (In this demo we simulate the RDMA transfer with a local copy)
-        generator_gpu_weights = torch.empty_like(cpu_staging, device="cuda:0")
-        generator_gpu_weights.copy_(cpu_staging, non_blocking=True)  # Simulates RDMA → GPU
-        torch.cuda.synchronize()
-
-        print("Generator: Weights loaded directly to GPU (via RDMA)")
-        print(f"  Weights match: {torch.allclose(trainer_weights, generator_gpu_weights)}")
-
-    demonstrate_cpu_staging()
-    return
-
-
-@app.cell
 def _(mo):
     mo.md(r"""
-    ## 7. Circular Weight Buffers
+    ## 6. Circular Weight Buffers
 
     ### The Versioning Problem
 
@@ -1111,10 +585,10 @@ def _(mo):
     ### Solution: Circular Buffer
 
     ```
-    Trainer writes:     v0 → v1 → v2 → v3 → v4 → v5 → ...
-                         ↓    ↓    ↓
-    Buffer slots:      [slot0][slot1][slot2]  (circular, reused)
-                         v3    v4    v5
+    Trainer writes:     v0    →  v1  →  v2  →  v3  →  v4  →  v5  → ...
+                         ↓        ↓      ↓
+    Buffer slots:      [slot0] [slot1] [slot2]  (circular, reused)
+                         v3      v4      v5
 
     Generator reads: "Give me latest" → v5
     ```
@@ -1123,101 +597,33 @@ def _(mo):
     - **Pre-registered RDMA buffers** - no memory registration on hot path
     - **Lock-free reads** - generators always get a consistent snapshot
     - **Bounded memory** - only N versions in flight
+
+    The key insight: register all slots at init time, then just write to them.
+    No allocation, no registration on the critical path.
+
+    **Want to see a full implementation?** Check out **06b_weight_sync_deep_dive.py** for a
+    complete `CircularWeightBuffer` class with versioning and RDMA integration.
     """)
     return
 
 
 @app.cell
-def _(torch):
-    from threading import Lock as _Lock
-    from typing import Tuple as _Tuple, Optional as _Opt
-
-    class CircularWeightBuffer:
-        """Circular buffer for versioned weight storage.
-
-        In production, this would be used inside a Monarch actor and slots
-        would be registered with RDMABuffer at init time.
-        """
-
-        def __init__(self, template_tensor: torch.Tensor, n_slots: int = 3):
-            self.n_slots = n_slots
-            self.slots = [
-                torch.empty_like(template_tensor).pin_memory()
-                if template_tensor.device.type == "cpu"
-                else torch.empty_like(template_tensor, device="cpu").pin_memory()
-                for _ in range(n_slots)
-            ]
-            self.latest_version = 0
-            self._lock = _Lock()
-
-            # In production (inside a Monarch actor):
-            # self.rdma_handles = [RDMABuffer(slot.view(torch.uint8).flatten()) for slot in self.slots]
-            # This pre-registers all slots with RDMA at init time (amortizes MR cost)
-
-        def publish(self, weights: torch.Tensor) -> int:
-            """Trainer publishes new weights. Returns version number."""
-            with self._lock:
-                slot_idx = self.latest_version % self.n_slots
-                self.slots[slot_idx].copy_(weights)
-                self.latest_version += 1
-                return self.latest_version - 1
-
-        def get_latest(self) -> _Tuple[torch.Tensor, int]:
-            """Generator gets latest weights. Non-blocking."""
-            with self._lock:
-                if self.latest_version == 0:
-                    raise RuntimeError("No weights published yet")
-                slot_idx = (self.latest_version - 1) % self.n_slots
-                version = self.latest_version - 1
-                return self.slots[slot_idx].clone(), version
-
-        def get_version(self, version: int) -> _Opt[torch.Tensor]:
-            """Get specific version if still available."""
-            with self._lock:
-                oldest_available = max(0, self.latest_version - self.n_slots)
-                if version < oldest_available or version >= self.latest_version:
-                    return None
-                slot_idx = version % self.n_slots
-                return self.slots[slot_idx].clone()
-
-    # Demo
-    _template = torch.randn(100, 100)
-    weight_buffer = CircularWeightBuffer(_template, n_slots=3)
-
-    # Trainer publishes versions
-    for _v in range(5):
-        _new_weights = torch.randn(100, 100) * (_v + 1)
-        published_v = weight_buffer.publish(_new_weights)
-        print(f"Published version {published_v}")
-
-    # Generator grabs latest
-    latest_weights, latest_version = weight_buffer.get_latest()
-    print(f"\nGenerator got version {latest_version}, weights mean: {latest_weights.mean():.2f}")
-
-    # Try to get old version (might be evicted)
-    old_weights = weight_buffer.get_version(1)
-    print(f"Version 1 available: {old_weights is not None}")
-
-    print("\nIn production: RDMABuffer handles would be pre-registered at init time")
-    print("Generators would call get_latest_handle() to get RDMA handle + version")
-    return (CircularWeightBuffer,)
-
-
-@app.cell
 def _(mo):
     mo.md(r"""
-    ## 8. Weight Re-sharding
+    ## 7. Weight Re-sharding
 
     ### The Sharding Mismatch Problem
 
-    Trainer and Generator often have **different tensor layouts**:
+    Trainer and Generator often have **different tensor layouts**. Consider an example:
 
     | Role | Parallelism | Sharding |
     |------|-------------|----------|
     | Trainer | FSDP (8 GPUs) | `Shard(0)` - rows split across 8 GPUs |
     | Generator | TP (2 GPUs) | `Shard(1)` - columns split across 2 GPUs |
 
-    Direct weight transfer doesn't work - we need **re-sharding**.
+    Therefore we cannot always directly transfer weights - we need **re-sharding**.
+
+    Consider a simple example where the trainer may be row-sharded and the generator may be column-sharded:
 
     ```
     Trainer (row-sharded):          Generator (column-sharded):
@@ -1227,491 +633,31 @@ def _(mo):
     │ GPU 1: rows 128+ │            │ 0-511   │ 512+    │
     └──────────────────┘            └─────────┴─────────┘
     ```
-    """)
-    return
 
+    ### Two Approaches
 
-@app.cell
-def _(mo):
-    mo.md(r"""
-    ### Approach 1: Gather Then Slice
-
-    Simple but inefficient:
-
-    ```
+    **Gather Then Slice** (simple but wasteful):
+    One approach is to materialize the entire tensor, i.e. `gather`, transfer the full tensor, and then slice on the receiver side:
     1. Each receiver gathers ALL sender shards → full tensor
     2. Each receiver slices out its portion
-    ```
+    3. **Problem**: 2x redundant data transfer
 
-    **Pros**: Simple, works with any sharding
-    **Cons**: 2x redundant data transfer (each receiver gets everything)
-
-    ### Approach 2: Routed/Direct Transfer
-
-    Optimal but complex:
-
-    ```
+    **Routed Transfer** (optimal):
+    A more efficient approach is to only transfer the data that needs to be transferred:
     1. Pre-compute which sender chunks overlap with which receiver regions
     2. Send only the exact chunks needed
-    3. Receivers place chunks directly in correct positions
-    ```
-
-    **Pros**: Minimal bandwidth (no redundancy)
-    **Cons**: Complex overlap computation
-    """)
-    return
-
-
-@app.cell
-def _():
-    from dataclasses import dataclass
-    from typing import List, Tuple
-
-    @dataclass
-    class ShardMetadata:
-        """Metadata describing a tensor shard."""
-        rank: int
-        global_shape: Tuple[int, ...]
-        offset: Tuple[int, ...]  # Start position in global tensor
-        local_shape: Tuple[int, ...]  # Shape of this shard
-
-    def compute_shard_metadata(
-        global_shape: Tuple[int, int],
-        num_ranks: int,
-        shard_dim: int,
-    ) -> List[ShardMetadata]:
-        """Compute shard metadata for a given sharding."""
-        shards = []
-        dim_size = global_shape[shard_dim]
-        shard_size = dim_size // num_ranks
-
-        for rank in range(num_ranks):
-            offset = [0, 0]
-            local_shape = list(global_shape)
-
-            offset[shard_dim] = rank * shard_size
-            local_shape[shard_dim] = shard_size
-
-            shards.append(ShardMetadata(
-                rank=rank,
-                global_shape=global_shape,
-                offset=tuple(offset),
-                local_shape=tuple(local_shape),
-            ))
-
-        return shards
-
-    # Demo: Trainer has row-sharding, Generator has column-sharding
-    _global_shape = (1024, 1024)
-
-    trainer_shards = compute_shard_metadata(_global_shape, num_ranks=4, shard_dim=0)
-    generator_shards = compute_shard_metadata(_global_shape, num_ranks=2, shard_dim=1)
-
-    print("Trainer shards (row-wise, 4 GPUs):")
-    for s in trainer_shards:
-        print(f"  Rank {s.rank}: offset={s.offset}, shape={s.local_shape}")
-
-    print("\nGenerator shards (column-wise, 2 GPUs):")
-    for s in generator_shards:
-        print(f"  Rank {s.rank}: offset={s.offset}, shape={s.local_shape}")
-    return (
-        List,
-        ShardMetadata,
-        Tuple,
-        compute_shard_metadata,
-        dataclass,
-        generator_shards,
-        trainer_shards,
-    )
-
-
-@app.cell
-def _(List, ShardMetadata, Tuple, compute_shard_metadata, dataclass, generator_shards, trainer_shards):
-    @dataclass
-    class TransferChunk:
-        """A chunk to transfer from sender to receiver."""
-        sender_rank: int
-        receiver_rank: int
-        sender_offset: Tuple[int, int]  # Where to read from sender
-        receiver_offset: Tuple[int, int]  # Where to write in receiver
-        shape: Tuple[int, int]  # Shape of the chunk
-
-    def compute_overlap(
-        sender: ShardMetadata,
-        receiver: ShardMetadata,
-    ) -> TransferChunk | None:
-        """Compute overlap between sender and receiver shards."""
-        # Find intersection in global coordinates
-        s_start = sender.offset
-        s_end = (s_start[0] + sender.local_shape[0], s_start[1] + sender.local_shape[1])
-
-        r_start = receiver.offset
-        r_end = (r_start[0] + receiver.local_shape[0], r_start[1] + receiver.local_shape[1])
-
-        # Compute intersection
-        inter_start = (max(s_start[0], r_start[0]), max(s_start[1], r_start[1]))
-        inter_end = (min(s_end[0], r_end[0]), min(s_end[1], r_end[1]))
-
-        # Check if there's actual overlap
-        if inter_start[0] >= inter_end[0] or inter_start[1] >= inter_end[1]:
-            return None
-
-        shape = (inter_end[0] - inter_start[0], inter_end[1] - inter_start[1])
-
-        # Convert to local coordinates
-        sender_local = (inter_start[0] - s_start[0], inter_start[1] - s_start[1])
-        receiver_local = (inter_start[0] - r_start[0], inter_start[1] - r_start[1])
-
-        return TransferChunk(
-            sender_rank=sender.rank,
-            receiver_rank=receiver.rank,
-            sender_offset=sender_local,
-            receiver_offset=receiver_local,
-            shape=shape,
-        )
-
-    def compute_transfer_plan(
-        sender_shards: List[ShardMetadata],
-        receiver_shards: List[ShardMetadata],
-    ) -> List[TransferChunk]:
-        """Compute all transfers needed for re-sharding."""
-        transfers = []
-        for sender in sender_shards:
-            for receiver in receiver_shards:
-                chunk = compute_overlap(sender, receiver)
-                if chunk is not None:
-                    transfers.append(chunk)
-        return transfers
-
-    # Compute transfer plan
-    transfer_plan = compute_transfer_plan(trainer_shards, generator_shards)
-
-    print(f"Transfer plan: {len(transfer_plan)} chunks needed\n")
-    for chunk in transfer_plan:
-        print(f"Sender {chunk.sender_rank} → Receiver {chunk.receiver_rank}")
-        print(f"  Read from sender offset {chunk.sender_offset}, shape {chunk.shape}")
-        print(f"  Write to receiver offset {chunk.receiver_offset}")
-        print()
-    return (compute_shard_metadata, compute_transfer_plan)
-
-
-@app.cell
-def _(mo):
-    mo.md(r"""
-    ### Live Benchmark: Gather vs Routed
-
-    Let's benchmark the two approaches with **3 layers sharded differently**:
-
-    | Layer | Shape | Trainer Sharding | Generator Sharding | Routing Opportunity |
-    |-------|-------|------------------|-------------------|---------------------|
-    | 0 | 1024×1024 | Row-sharded (4-way) | Row-sharded (2-way) | Yes! Same dim |
-    | 1 | 512×2048 | Col-sharded (4-way) | Col-sharded (2-way) | Yes! Same dim |
-    | 2 | 256×256 | Replicated | Replicated | No sharding |
+    3. **Benefit**: Minimal bandwidth, no redundancy
 
     ```
-    Example: Layer 0 (1024×1024) - Both row-sharded, different granularity
-
-    TRAINER (4-way row shard)                       GENERATOR (2-way row shard)
-    ┌──────────────────────────────┐                ┌─────────────────────────────────┐
-    │ T0: rows 0-255    [256×1024] │ ────────┐      │ G0: rows 0-511    [512×1024]    │
-    ├──────────────────────────────┤         │      │     ↑                           │
-    │ T1: rows 256-511  [256×1024] │ ────────┼──────│     T0 + T1 only                │
-    ├──────────────────────────────┤         │      ├─────────────────────────────────┤
-    │ T2: rows 512-767  [256×1024] │ ────────┼──────│ G1: rows 512-1023 [512×1024]    │
-    ├──────────────────────────────┤         │      │     ↑                           │
-    │ T3: rows 768-1023 [256×1024] │ ────────┘      │     T2 + T3 only                │
-    └──────────────────────────────┘                └─────────────────────────────────┘
-
-    GATHER APPROACH:                                ROUTED APPROACH:
-    ┌────────────────────────────────────┐          ┌────────────────────────────────────┐
-    │                                    │          │                                    │
-    │  G0 receives:                      │          │  G0 receives:                      │
-    │    T0 → full 256×1024 ✓ needed     │          │    T0 → full 256×1024 ✓            │
-    │    T1 → full 256×1024 ✓ needed     │          │    T1 → full 256×1024 ✓            │
-    │    T2 → full 256×1024 ✗ WASTED     │          │    (skips T2, T3 - no overlap!)    │
-    │    T3 → full 256×1024 ✗ WASTED     │          │                                    │
-    │                                    │          │                                    │
-    │  G0 transfers: 4 shards            │          │  G0 transfers: 2 shards            │
-    │  G1 transfers: 4 shards            │          │  G1 transfers: 2 shards            │
-    │  Total: 8 transfers                │          │  Total: 4 transfers                │
-    │  50% wasted bandwidth!             │          │  0% wasted bandwidth!              │
-    │                                    │          │                                    │
-    └────────────────────────────────────┘          └────────────────────────────────────┘
+    GATHER: G0 receives T0,T1,T2,T3 → discards T2,T3 (50% waste!)
+    ROUTED: G0 receives T0,T1 only → exactly what it needs
     ```
 
-    This exercises the re-sharding logic across different patterns. We'll use RDMAAction
-    to batch all the transfers and compare:
+    The routed approach batches all needed transfers into one plan.
+    Pre-compute the plan once at handshake, execute it on each sync.
 
-    - **Gather**: Each receiver gets ALL data from ALL senders, then slices locally
-    - **Routed**: Each receiver only gets data it actually needs (based on overlap)
-    """)
-    return
-
-
-@app.cell
-def _(Actor, RDMAAction, RDMABuffer, ShardMetadata, compute_shard_metadata, compute_transfer_plan, current_rank, endpoint, time, torch):
-    import os
-    from torch.distributed._tensor import DTensor, Shard, Replicate, init_device_mesh
-
-    # Configuration
-    NUM_TRAINER_RANKS = 4
-    NUM_GENERATOR_RANKS = 2
-
-    # Layer configs: (global_shape, trainer_placement, generator_placement)
-    # The placements define how each side shards the tensor
-    LAYER_CONFIGS = [
-        # Layer 0: 1024x1024, both row-sharded (Shard(0)) but different granularity
-        {"shape": (1024, 1024), "trainer_place": Shard(0), "gen_place": Shard(0)},
-        # Layer 1: 512x2048, both col-sharded (Shard(1)) but different granularity
-        {"shape": (512, 2048), "trainer_place": Shard(1), "gen_place": Shard(1)},
-        # Layer 2: 256x256, replicated on both sides
-        {"shape": (256, 256), "trainer_place": Replicate(), "gen_place": Replicate()},
-    ]
-
-    def placement_to_shard_dim(placement) -> int | None:
-        """Extract shard dimension from DTensor placement."""
-        if isinstance(placement, Shard):
-            return placement.dim
-        return None  # Replicate or other
-
-    def compute_layer_transfer_plan(layer_cfg, trainer_ranks, gen_ranks, gen_rank):
-        """Use DTensor placement metadata to compute transfer plan for one layer."""
-        trainer_dim = placement_to_shard_dim(layer_cfg["trainer_place"])
-        gen_dim = placement_to_shard_dim(layer_cfg["gen_place"])
-
-        if trainer_dim is None:
-            # Replicated on trainer side - just need one trainer
-            return [(0, None)]  # (trainer_rank, chunk_info)
-
-        if gen_dim is None:
-            # Replicated on generator side - need all trainers to reconstruct
-            return [(t, None) for t in range(trainer_ranks)]
-
-        # Both sharded - use compute_transfer_plan to find overlaps
-        trainer_shards = compute_shard_metadata(layer_cfg["shape"], trainer_ranks, trainer_dim)
-        gen_shards = compute_shard_metadata(layer_cfg["shape"], gen_ranks, gen_dim)
-
-        # Get this generator's shard metadata
-        my_shard = gen_shards[gen_rank]
-
-        # Find which trainers have overlapping data
-        overlapping = []
-        for t_shard in trainer_shards:
-            # Check if there's any overlap
-            t_start = t_shard.offset[trainer_dim]
-            t_end = t_start + t_shard.local_shape[trainer_dim]
-            g_start = my_shard.offset[gen_dim] if gen_dim == trainer_dim else 0
-            g_end = (my_shard.offset[gen_dim] + my_shard.local_shape[gen_dim]
-                     if gen_dim == trainer_dim else layer_cfg["shape"][trainer_dim])
-
-            if t_end > g_start and t_start < g_end:
-                overlapping.append((t_shard.rank, t_shard))
-
-        return overlapping
-
-    class DTensorTrainer(Actor):
-        """Trainer with DTensor shards - uses placement metadata for resharding."""
-
-        def __init__(self):
-            self.rank = current_rank().rank
-            self.dtensors = []
-            self.handles = []
-            self.device_mesh = None
-
-        @endpoint
-        def setup_distributed(self):
-            """Initialize distributed and create DTensors with proper placements."""
-            world_size = int(os.environ.get("WORLD_SIZE", "1"))
-
-            if not torch.distributed.is_initialized():
-                torch.distributed.init_process_group(backend="gloo")
-
-            self.device_mesh = init_device_mesh("cpu", (world_size,))
-
-            # Create DTensors based on layer configs
-            for i, cfg in enumerate(LAYER_CONFIGS):
-                placement = cfg["trainer_place"]
-                shard_dim = placement_to_shard_dim(placement)
-
-                if shard_dim is not None:
-                    # Sharded: compute local shape
-                    local_shape = list(cfg["shape"])
-                    local_shape[shard_dim] = cfg["shape"][shard_dim] // world_size
-                    local_shape = tuple(local_shape)
-                else:
-                    # Replicated: full shape
-                    local_shape = cfg["shape"]
-
-                local_tensor = torch.zeros(local_shape, dtype=torch.float32)
-                local_tensor.fill_(float(i * 10 + self.rank))
-
-                dt = DTensor.from_local(local_tensor, self.device_mesh, [placement], run_check=False)
-                self.dtensors.append(dt)
-                self.handles.append(RDMABuffer(local_tensor.view(torch.uint8).flatten()))
-
-            shapes = [tuple(dt.to_local().shape) for dt in self.dtensors]
-            placements = [str(cfg["trainer_place"]) for cfg in LAYER_CONFIGS]
-            print(f"Trainer {self.rank}: shapes={shapes}, placements={placements}")
-            return shapes
-
-        @endpoint
-        def get_layer_handle(self, layer_idx: int):
-            """Return (shape, handle) for a layer's local shard."""
-            return (tuple(self.dtensors[layer_idx].to_local().shape), self.handles[layer_idx])
-
-        @endpoint
-        def destroy(self):
-            if torch.distributed.is_initialized():
-                torch.distributed.destroy_process_group()
-
-    class DTensorGenerator(Actor):
-        """Generator that uses DTensor placement metadata for smart resharding."""
-
-        def __init__(self):
-            self.rank = current_rank().rank
-            self.action = None
-            self.recv_buffers = []
-            self.device_mesh = None
-
-        @endpoint
-        def setup_distributed(self):
-            world_size = int(os.environ.get("WORLD_SIZE", "1"))
-            if not torch.distributed.is_initialized():
-                torch.distributed.init_process_group(backend="gloo")
-            self.device_mesh = init_device_mesh("cpu", (world_size,))
-            print(f"Generator {self.rank}: distributed initialized")
-            return world_size
-
-        @endpoint
-        def handshake_gather(self, trainers):
-            """Gather approach: fetch ALL shards (ignores placement metadata)."""
-            total = len(trainers) * len(LAYER_CONFIGS)
-            return f"Gather: {total} transfers (all trainers × all layers)"
-
-        @endpoint
-        def handshake_routed(self, trainers):
-            """Routed approach: use DTensor placements to compute minimal transfers."""
-            self.action = RDMAAction()
-            self.recv_buffers = []
-            total_transfers = 0
-
-            for layer_idx, cfg in enumerate(LAYER_CONFIGS):
-                # Use placement metadata to compute which trainers we need
-                overlapping = compute_layer_transfer_plan(
-                    cfg, NUM_TRAINER_RANKS, NUM_GENERATOR_RANKS, self.rank
-                )
-
-                for t_rank, _ in overlapping:
-                    shape, handle = trainers[t_rank].get_layer_handle.call_one(layer_idx).get()
-                    buf = torch.zeros(shape, dtype=torch.float32)
-                    self.recv_buffers.append(buf)
-                    self.action.read_into(handle, buf.view(torch.uint8).flatten())
-                    total_transfers += 1
-
-            return f"Routed: {total_transfers} transfers (placement-aware)"
-
-        @endpoint
-        def receive_routed(self) -> dict:
-            start = time.perf_counter()
-            self.action.submit().get()
-            elapsed_ms = (time.perf_counter() - start) * 1000
-            return {"elapsed_ms": elapsed_ms}
-
-        @endpoint
-        def destroy(self):
-            if torch.distributed.is_initialized():
-                torch.distributed.destroy_process_group()
-
-    print("DTensor actors defined (using placement metadata for routing)")
-    return (
-        DTensorGenerator,
-        DTensorTrainer,
-        LAYER_CONFIGS,
-        NUM_GENERATOR_RANKS,
-        NUM_TRAINER_RANKS,
-    )
-
-
-@app.cell
-def _(
-    DTensorGenerator,
-    DTensorTrainer,
-    LAYER_CONFIGS,
-    NUM_GENERATOR_RANKS,
-    NUM_TRAINER_RANKS,
-    this_host,
-    time,
-):
-    from monarch.spmd import setup_torch_elastic_env
-
-    # Spawn trainer mesh (4 procs, one actor per proc)
-    _trainer_procs = this_host().spawn_procs(per_host={"procs": NUM_TRAINER_RANKS})
-    setup_torch_elastic_env(_trainer_procs)  # Sets WORLD_SIZE, RANK, MASTER_ADDR, etc.
-    _trainers = _trainer_procs.spawn("trainers", DTensorTrainer)
-
-    # Spawn generator mesh (2 procs)
-    _gen_procs = this_host().spawn_procs(per_host={"procs": NUM_GENERATOR_RANKS})
-    setup_torch_elastic_env(_gen_procs)
-    _generators = _gen_procs.spawn("generators", DTensorGenerator)
-
-    print("\n=== DTensor Reshard Benchmark ===")
-    print(f"Trainer mesh: {NUM_TRAINER_RANKS} ranks, Generator mesh: {NUM_GENERATOR_RANKS} ranks")
-    print("Layer configs:")
-    for i, cfg in enumerate(LAYER_CONFIGS):
-        print(f"  Layer {i}: {cfg['shape']}, trainer={cfg['trainer_place']}, gen={cfg['gen_place']}")
-
-    # Initialize distributed on trainers and generators (separate process groups)
-    print("\nSetting up distributed...")
-    _trainer_shapes = _trainers.setup_distributed.call().get()
-    _gen_world = _generators.setup_distributed.call().get()
-    print(f"  Trainer shapes: {[s for _, s in _trainer_shapes]}")
-    print(f"  Generator world sizes: {[w for _, w in _gen_world]}")
-
-    # Get list of individual trainer actors for the generators to call
-    _trainer_list = [_trainers.slice(procs=i) for i in range(NUM_TRAINER_RANKS)]
-
-    # Handshake to build transfer plans (uses DTensor placement metadata!)
-    print("\nBuilding transfer plans (using placement metadata)...")
-    _results = _generators.handshake_routed.call(_trainer_list).get()
-    for _i, _r in enumerate(_results):
-        print(f"  Generator {_i}: {_r}")
-
-    # Run benchmark
-    print("\nRunning transfers...")
-    _times = []
-    for _step in range(3):
-        _step_start = time.perf_counter()
-        _results = _generators.receive_routed.call().get()
-        _step_ms = (time.perf_counter() - _step_start) * 1000
-        _times.append(_step_ms)
-        print(f"  Step {_step + 1}: {_step_ms:.1f}ms")
-
-    _avg = sum(_times) / len(_times)
-    print(f"  Average: {_avg:.1f}ms")
-
-    # Cleanup distributed process groups
-    _trainers.destroy.call().get()
-    _generators.destroy.call().get()
-    print("\nDistributed cleanup complete")
-    return
-
-
-@app.cell
-def _(mo):
-    mo.md(r"""
-    **What the benchmark shows:**
-
-    - **Gather**: Each receiver talks to ALL trainers and receives ALL their data, then discards
-      what it doesn't need. With 4 trainers and 2 generators, that's 8 transfers per layer.
-    - **Routed**: Each receiver only talks to trainers with overlapping data. For same-dimension
-      sharding (trainer 4-way, generator 2-way), each generator only needs 2 of the 4 shards.
-      That's 4 transfers per layer - **50% fewer connections**.
-
-    For large models where weight sync is a bottleneck, the routed approach can save
-    significant bandwidth. The handshake pattern amortizes the overlap computation cost.
-
-    The key insight: **RDMAAction lets you batch all the routed transfers into one plan**,
-    so you get the efficiency of smart routing with the simplicity of a single `submit()` call.
+    **Want to see the overlap computation and benchmarks?** Check out **06b_weight_sync_deep_dive.py**
+    for the full DTensor re-sharding implementation with placement-aware routing.
     """)
     return
 
@@ -1719,38 +665,7 @@ def _(mo):
 @app.cell
 def _(mo):
     mo.md(r"""
-    ### The DTensor Dream (and Reality)
-
-    If trainer and generator both used **DTensor** with the same sharding spec, re-sharding
-    would be automatic - the framework handles overlap computation and transfers.
-
-    ```python
-    # Ideal world: DTensor handles it
-    trainer_weights: DTensor  # Shard(0) across 8 GPUs
-    generator_weights: DTensor  # Shard(1) across 2 GPUs
-
-    # Re-sharding is just redistribution
-    generator_weights = trainer_weights.redistribute(generator_placement)
-    ```
-
-    **In practice, it's harder**:
-    - vLLM does its own sharding and weight fusing (not DTensor-compatible)
-    - Training frameworks (FSDP, etc.) have different abstractions
-    - You often need custom overlap computation like we showed above
-
-    The routed approach (compute overlaps, send only needed chunks) is 2x faster than
-    naive gather-then-slice, but requires this manual coordination.
-
-    **For cross-node RDMA transfers**, the key insight remains: pre-compute the transfer
-    plan once, then each sync just executes the planned RDMA operations with RDMAAction.
-    """)
-    return
-
-
-@app.cell
-def _(mo):
-    mo.md(r"""
-    ## 9. Putting It All Together
+    ## 8. Putting It All Together
 
     The full async RL weight sync pattern:
 
@@ -1797,60 +712,130 @@ def _(mo):
 @app.cell
 def _(mo):
     mo.md(r"""
-    ### Code Pattern
+    ### Live Demo: Async Weight Sync
 
-    ```python
-    # Trainer side
-    class Trainer(Actor):
-        def __init__(self):
-            self.weight_buffer = CircularWeightBuffer(
-                template=self.model.state_dict_tensor(),
-                n_slots=3,
-            )
+    Let's see this in action! We'll simulate the core async RL pattern:
 
-        @endpoint
-        def get_weight_handle(self) -> Tuple[RDMABuffer, int]:
-            '''Return handle to latest weights and version.'''
-            slot_idx = (self.weight_buffer.latest_version - 1) % 3
-            handle = self.weight_buffer.rdma_handles[slot_idx]
-            version = self.weight_buffer.latest_version - 1
-            return handle, version
+    - **Trainer loop**: Runs training steps, publishes new weights to a 3-slot circular buffer
+    - **Generator loop**: Periodically syncs to latest weights, then generates
 
-        async def train_loop(self):
-            while True:
-                loss = self.train_step()
-                if self.step % sync_interval == 0:
-                    # Non-blocking publish
-                    self.weight_buffer.publish(self.model.weights)
-
-    # Generator side
-    class Generator(Actor):
-        def __init__(self, trainer_ref):
-            self.trainer = trainer_ref
-            self.current_version = -1
-
-        async def maybe_sync_weights(self):
-            handle, version = await self.trainer.get_weight_handle.call_one().get()
-            if version > self.current_version:
-                # Pull via RDMA directly into GPU memory
-                gpu_weights = self.model.weights.view(torch.uint8).flatten()
-                await handle.read_into(gpu_weights)
-                self.current_version = version
-
-        async def generate_loop(self):
-            while True:
-                await self.maybe_sync_weights()
-                output = self.generate(prompt)
-                self.submit_to_buffer(output)
-    ```
+    Both loops run **concurrently and independently**. The trainer never waits for generators,
+    and generators grab weights whenever they're ready. To verify correctness, we'll set
+    each weight tensor to `torch.ones(size) * version` - the generator can then check that
+    it received the right data.
     """)
+    return
+
+
+@app.cell
+def _(Actor, RDMABuffer, endpoint, is_rdma_available, this_host, time, torch):
+
+    def show_fallback():
+        print("(RDMA not available - showing conceptual flow)\n")
+        print("What would happen with RDMA:")
+        print("  [Trainer] Publishes v0, v1, v2... to circular buffer")
+        print("  [Generator] Syncs when ready, verifies weights match version")
+        print("  Both run independently, no blocking!")
+
+    try:
+        if not is_rdma_available():
+            show_fallback()
+        else:
+            class Trainer(Actor):
+                """Trainer with 3-slot circular buffer."""
+
+                def __init__(self, weight_size: int):
+                    self.n_slots = 3
+                    self.version = 0
+                    self.slots = []
+                    self.handles = []
+                    for _ in range(self.n_slots):
+                        slot = torch.zeros(weight_size, dtype=torch.float32)
+                        self.slots.append(slot)
+                        self.handles.append(RDMABuffer(slot.view(torch.uint8).flatten()))
+                    print(f"[Trainer] Initialized {self.n_slots}-slot circular buffer")
+
+                @endpoint
+                def get_latest(self) -> tuple:
+                    if self.version == 0:
+                        return None, -1
+                    v = self.version - 1
+                    return self.handles[v % self.n_slots], v
+
+                @endpoint
+                def run_loop(self, n_steps: int, step_time: float):
+                    """Train loop: step → publish → repeat."""
+                    for _ in range(n_steps):
+                        time.sleep(step_time)  # Simulate train step
+
+                        # Publish: set weights = version (for verification)
+                        slot_idx = self.version % self.n_slots
+                        self.slots[slot_idx].fill_(float(self.version))
+                        self.version += 1
+                        print(f"[Trainer] Step done, published v{self.version - 1} to slot {slot_idx}")
+
+                    return self.version
+
+            class Generator(Actor):
+                """Generator that syncs weights and generates."""
+
+                def __init__(self, weight_size: int, trainer):
+                    self.trainer = trainer
+                    self.weights = torch.zeros(weight_size, dtype=torch.float32)
+                    self.weight_bytes = self.weights.view(torch.uint8).flatten()
+                    self.current_version = -1
+                    print(f"[Generator] Initialized, waiting for weights...")
+
+                @endpoint
+                def run_loop(self, n_iters: int, gen_time: float):
+                    """Generate loop: sync weights → generate → repeat."""
+                    for _ in range(n_iters):
+                        # Sync weights if newer available
+                        handle, version = self.trainer.get_latest.call_one().get()
+                        if handle is not None and version > self.current_version:
+                            handle.read_into(self.weight_bytes).get()
+
+                            # Verify: all weights should equal version
+                            actual = int(self.weights[0].item())
+                            assert actual == version, f"Mismatch! Got {actual}, expected {version}"
+
+                            self.current_version = version
+                            print(f"[Generator] Synced to v{version} ✓ (verified)")
+
+                        time.sleep(gen_time)  # Simulate generation
+                        print(f"[Generator] Generated output (using v{self.current_version})")
+
+                    return self.current_version
+
+            # Spawn actors
+            _procs = this_host().spawn_procs(per_host={"procs": 2})
+            _trainer = _procs.slice(procs=0).spawn("trainer", Trainer, 1000)
+            _generator = _procs.slice(procs=1).spawn("gen", Generator, 1000, _trainer)
+
+            print("\n--- Running async RL simulation (~2 seconds) ---\n")
+
+            # Run both loops concurrently
+            _trainer_future = _trainer.run_loop.call_one(6, 0.25)  # 6 train steps
+            _gen_future = _generator.run_loop.call_one(5, 0.35)    # 5 generate iters
+
+            # Wait for both to complete
+            _final_version = _trainer_future.get()
+            _final_gen_version = _gen_future.get()
+
+            print(f"\n--- Done! Trainer published {_final_version} versions, "
+                  f"generator ended on v{_final_gen_version} ---")
+            print("→ Both ran independently, weights verified via RDMA!")
+
+    except Exception as e:
+        print(f"(Demo failed: {e})")
+        show_fallback()
     return
 
 
 @app.cell
 def _(mo):
     mo.md(r"""
-    ## 10. Going Further: TorchStore
+    ## 9. Going Further: TorchStore
 
     All the patterns we've covered - RDMA memory registration, magic pointers, circular buffers,
     pre-computed transfer plans - are building blocks. If you need a **production-ready solution**,
@@ -1875,30 +860,12 @@ def _(mo):
     loaded = await ts.get_state_dict()
     ```
 
-    ### RDMA Under the Hood
-
-    TorchStore implements the patterns we've discussed:
-
-    - **Transport abstraction** with automatic RDMA detection:
-      1. TorchComms RDMA (highest performance)
-      2. Monarch RDMA (fallback)
-      3. Monarch RPC (no RDMA available)
-
-    - **Memory region management**: Pre-registers buffers, handles cleanup
-
-    - **DTensor support**: Efficiently stores/retrieves tensor shards across ranks
-
-    - **Tensor slicing**: Fetch arbitrary slices without retrieving the whole tensor
-
-    The key insight: **TorchStore lets you think in key-value semantics while getting RDMA
-    performance**. No manual buffer management, no handle passing, no overlap computation.
-
     ### When to Use What
 
     | Scenario | Solution |
     |----------|----------|
-    | Learning RDMA patterns | This notebook's examples |
-    | Custom RL weight sync | Build on `RDMABuffer` + `RDMAAction` |
+    | Learning RDMA patterns | This notebook + 06b |
+    | Custom RL weight sync | See 06b for `RDMABuffer` + `RDMAAction` patterns |
     | General tensor storage | Use TorchStore |
     | Checkpointing | Use TorchStore's `put_state_dict` |
     """)
@@ -1912,30 +879,28 @@ def _(mo):
 
     ### Key Takeaways
 
-    1. **Bandwidth hierarchy matters**: NVLink (450 GB/s) >> InfiniBand (50-100 GB/s) >> PCIe
-       - Know your hardware, optimize for the right interconnect
+    1. **Bandwidth hierarchy matters**: NVLink (900 GB/s) >> InfiniBand (50 GB/s)
+       - Keep frequent operations on NVLink, use RDMA for cross-node
 
-    2. **Collectives vs P2P**: Collectives are synchronized; RL needs async P2P
-       - High variance in generation times makes blocking expensive
+    2. **Collectives block, RL needs async**: High variance in generation times makes
+       synchronous operations expensive
 
     3. **Magic pointer pattern**: Tiny handle over control plane, bulk data over data plane
        - ~100 bytes to describe 10 GB transfer
 
     4. **CPU staging**: Temporal decoupling for async RL
-       - GPU-native RDMA works for sync cases
-       - CPU staging ensures nothing blocks on the critical path
+       - Nothing blocks on the critical path
 
     5. **Circular buffers**: Version weights without memory churn
        - Pre-register RDMA buffers, reuse slots
-       - Generators grab latest, never stale
 
     6. **Weight re-sharding**: Different layouts need overlap computation
-       - Routed approach is 2x faster than gather
-       - Pre-compute transfer plan, minimize redundant data
+       - Routed approach avoids redundant transfers
 
-    ### Next Steps
+    ### Want More?
 
-    See **07_async_rl_e2e.py** for a complete async RL system that uses these patterns.
+    - **06b_weight_sync_deep_dive.py** - ibverbs internals, benchmarks, full implementations
+    - **07_async_rl_e2e.py** - Complete async RL system using these patterns
     """)
     return
 

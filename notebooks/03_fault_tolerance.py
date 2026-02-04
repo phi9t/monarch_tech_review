@@ -414,6 +414,8 @@ def _(mo):
     | Building infrastructure | Supervision trees |
     | Massive scale training | TorchFT + Monarch |
 
+    **Coming up:** In the Services notebook, we'll see the try/except pattern in action - building a generator pool that routes around failures and recovers unhealthy replicas.
+
     **Next:** Async RL - putting it all together with services, RDMA, and async loops
     """)
     return

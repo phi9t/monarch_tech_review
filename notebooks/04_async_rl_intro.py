@@ -160,6 +160,54 @@ def _():
 @app.cell
 def _(mo):
     mo.md(r"""
+    ### How Tool Injection Works
+
+    The `generate_with_tools` function implements an **agentic loop**:
+
+    ```
+    ┌─────────────────────────────────────────────────────────────┐
+    │  1. Generate text until tool call detected                  │
+    │     └─ Uses StoppingCriteria that regex-matches LOOKUP[...] │
+    │                                                             │
+    │  2. Parse the tool call                                     │
+    │     └─ Extract: LOOKUP[banana] → tool="LOOKUP", arg="banana"│
+    │                                                             │
+    │  3. Execute tool against secret table                       │
+    │     └─ LOOKUP[banana] → 42                                  │
+    │                                                             │
+    │  4. Inject result into context and continue                 │
+    │     └─ Append: "[Result: 42]\n" then resume generation      │
+    │                                                             │
+    │  5. Repeat until no tool calls or max turns                 │
+    └─────────────────────────────────────────────────────────────┘
+    ```
+
+    **The key trick:** We use a custom `StoppingCriteria` that halts generation the moment it sees a complete tool call pattern. This lets us intercept, execute, and resume:
+
+    ```python
+    class StopAtToolCall(StoppingCriteria):
+        def __call__(self, input_ids, scores, **kwargs) -> bool:
+            new_text = tokenizer.decode(input_ids[0, self.prompt_length:])
+            # Stop if we see LOOKUP[...], GETKEY[...], or FETCH[...]
+            return bool(re.search(r"(LOOKUP|GETKEY|FETCH)\[[^\]]+\]", new_text))
+    ```
+
+    After each tool call, we inject the result and continue from where we left off:
+
+    ```python
+    result_injection = f"\n[Result: {tool_result}]\n"
+    all_text += new_text + result_injection
+    # Next generate() call continues from this extended context
+    ```
+
+    This is how the model "learns to use tools" - it sees examples in the system prompt, generates a tool call, gets the result injected, and can use that information to produce the final answer.
+    """)
+    return
+
+
+@app.cell
+def _(mo):
+    mo.md(r"""
     ## Task Difficulty Levels
 
     We have four task types, each testing different capabilities. Let's look at what each one asks the model to do:
