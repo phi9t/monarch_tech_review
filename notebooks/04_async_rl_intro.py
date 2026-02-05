@@ -753,44 +753,81 @@ def _(mean_gen_time, mo, num_batches, num_generators, train_time, variance, weig
         total_sync_time = sync_time
 
         # ===== ASYNC SIMULATION =====
+        # In async: generators run continuously, pulling weights when new version available
+        # Weight sync is generator-side: after each batch, if trainer has new weights, pull them
         async_bars = []
 
+        # Track when each training step completes (new weights available)
+        train_complete_times = []
+        t = 0
+        while t < sum(gen_times[0]) * 1.5:  # Run trainer long enough
+            t += train_val
+            train_complete_times.append(t)
+
+        # Each generator: generate, then sync if new weights available
         for g in range(n_gens_val):
             t = 0
+            last_synced_version = -1
             for batch in range(n_batch_val):
+                # Check if new weights available (trainer completed a step since last sync)
+                new_version = sum(1 for tc in train_complete_times if tc <= t) - 1
+                if new_version > last_synced_version and new_version >= 0:
+                    # Pull new weights (sync time)
+                    async_bars.append((g, t, sync_val, "#9467bd"))
+                    t += sync_val
+                    last_synced_version = new_version
+
+                # Generate
                 duration = gen_times[g][batch]
                 async_bars.append((g, t, duration, batch_colors[batch]))
                 t += duration
 
-        total_gen_time = max(sum(gen_times[g]) for g in range(n_gens_val))
+        total_gen_time = max(
+            sum(gen_times[g]) + sync_val * n_batch_val  # Rough upper bound
+            for g in range(n_gens_val)
+        )
+
+        # Trainer just runs continuously
         t = 0
         train_batch = 0
         while t < total_gen_time:
             async_bars.append((n_gens_val, t, train_val, "crimson"))
-            # Weight sync happens in parallel / pipelined (overlapped with next train)
-            async_bars.append((n_gens_val + 1, t, sync_val, "#9467bd"))
             t += train_val
             train_batch += 1
 
-        total_async_time = max(total_gen_time, t)
+        total_async_time = max(
+            max(bar[1] + bar[2] for bar in async_bars if bar[0] < n_gens_val),  # Max generator end
+            t  # Trainer end
+        )
 
         # ===== PLOTTING =====
         fig, axes = plt.subplots(1, 2, figsize=(14, 4.5 + n_gens_val * 0.3))
-        row_labels = [f"Gen {i+1}" for i in range(n_gens_val)] + ["Trainer", "Wt Sync"]
+        sync_row_labels = [f"Gen {i+1}" for i in range(n_gens_val)] + ["Trainer", "Wt Sync"]
+        async_row_labels = [f"Gen {i+1}" for i in range(n_gens_val)] + ["Trainer"]
 
-        for ax, bars, title, total_time in [
-            (axes[0], sync_bars, "Sync RL", total_sync_time),
-            (axes[1], async_bars, "Async RL", total_async_time)
-        ]:
-            for row, start, duration, color in bars:
-                ax.barh(row, duration, left=start, height=0.6, color=color, edgecolor="black", linewidth=0.5)
-            ax.set_yticks(range(len(row_labels)))
-            ax.set_yticklabels(row_labels)
-            ax.set_xlabel("Time (ms)")
-            ax.set_title(f"{title} (total: {total_time:.0f}ms)")
-            ax.set_xlim(0, max(total_sync_time, total_async_time) * 1.05)
-            ax.grid(axis="x", alpha=0.3)
-            ax.invert_yaxis()
+        # Sync RL plot
+        ax = axes[0]
+        for row, start, duration, color in sync_bars:
+            ax.barh(row, duration, left=start, height=0.6, color=color, edgecolor="black", linewidth=0.5)
+        ax.set_yticks(range(len(sync_row_labels)))
+        ax.set_yticklabels(sync_row_labels)
+        ax.set_xlabel("Time (ms)")
+        ax.set_title(f"Sync RL (total: {total_sync_time:.0f}ms)")
+        ax.set_xlim(0, max(total_sync_time, total_async_time) * 1.05)
+        ax.grid(axis="x", alpha=0.3)
+        ax.invert_yaxis()
+
+        # Async RL plot
+        ax = axes[1]
+        for row, start, duration, color in async_bars:
+            ax.barh(row, duration, left=start, height=0.6, color=color, edgecolor="black", linewidth=0.5)
+        ax.set_yticks(range(len(async_row_labels)))
+        ax.set_yticklabels(async_row_labels)
+        ax.set_xlabel("Time (ms)")
+        ax.set_title(f"Async RL (total: {total_async_time:.0f}ms)")
+        ax.set_xlim(0, max(total_sync_time, total_async_time) * 1.05)
+        ax.grid(axis="x", alpha=0.3)
+        ax.invert_yaxis()
 
         # Legend
         patches = [mpatches.Patch(color=batch_colors[i], label=f"Batch {i+1}") for i in range(n_batch_val)]

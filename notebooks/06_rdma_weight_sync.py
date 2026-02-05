@@ -17,15 +17,7 @@ def _():
     import torch
     from monarch.actor import Actor, endpoint, this_host, current_rank
     from monarch.rdma import RDMABuffer, is_rdma_available
-    return (
-        Actor,
-        RDMABuffer,
-        current_rank,
-        endpoint,
-        is_rdma_available,
-        this_host,
-        torch,
-    )
+    return Actor, RDMABuffer, endpoint, is_rdma_available, this_host, torch
 
 
 @app.cell
@@ -745,6 +737,7 @@ def _(
     this_host,
     torch,
 ):
+    import threading
 
     def show_fallback():
         print("(RDMA not available - showing conceptual flow)\n")
@@ -772,36 +765,28 @@ def _(
                     print(f"[Trainer] Initialized {self.n_slots}-slot circular buffer")
 
                 @endpoint
-                async def get_latest(self) -> tuple:
+                def get_latest(self) -> tuple:
                     if self.version == 0:
                         return None, -1
                     v = self.version - 1
                     return self.handles[v % self.n_slots], v
 
                 @endpoint
-                async def run_loop(self, n_steps: int, step_time: float):
-                    """Train loop: step → publish → repeat."""
+                def train_step(self):
+                    """Single training step: publish new weights."""
                     import sys
-                    import asyncio
-
-                    for step in range(n_steps):
-                        # Wait (simulating training work)
-                        await asyncio.sleep(step_time)
-
-                        # Publish new weights
-                        slot_idx = self.version % self.n_slots
-                        self.slots[slot_idx].fill_(float(self.version))
-                        self.version += 1
-                        print(f"[Trainer] Published v{self.version - 1}")
-                        sys.stdout.flush()
-
+                    slot_idx = self.version % self.n_slots
+                    self.slots[slot_idx].fill_(float(self.version))
+                    self.version += 1
+                    print(f"[Trainer] Published v{self.version - 1}")
+                    sys.stdout.flush()
                     return self.version
 
             class Generator(Actor):
                 """Generator that syncs weights and generates."""
 
                 def __init__(self, weight_size: int, trainer):
-                    self.gen_id = current_rank().rank  # Get ID from mesh position
+                    self.gen_id = current_rank().rank
                     self.trainer = trainer
                     self.weights = torch.zeros(weight_size, dtype=torch.float32)
                     self.weight_bytes = self.weights.view(torch.uint8).flatten()
@@ -809,42 +794,21 @@ def _(
                     print(f"[Gen {self.gen_id}] Initialized")
 
                 @endpoint
-                async def run_loop(self, n_iters: int, gen_time: float):
-                    """Generate loop: sync weights → generate → repeat."""
+                def generate_step(self) -> int:
+                    """Single generate step: sync if needed, then generate."""
                     import sys
-                    import asyncio
-
-                    generations = 0
-                    while generations < n_iters:
-                        # Step 1: Try to sync weights
-                        handle, version = await self.trainer.get_latest.call_one()
-                        if handle is not None and version > self.current_version:
-                            await handle.read_into(self.weight_bytes)
-
-                            # The actual version in the buffer (trainer may have advanced)
-                            actual = int(self.weights[0].item())
-                            # Accept if we got this version or newer (async means trainer may have updated)
-                            if actual >= version:
-                                self.current_version = actual
-                                print(f"[Gen {self.gen_id}] Synced to v{actual} ✓")
-                            else:
-                                # Stale read (slot was overwritten) - skip, will retry
-                                print(f"[Gen {self.gen_id}] Stale read, retrying...")
+                    # Try to sync weights
+                    handle, version = self.trainer.get_latest.call_one().get()
+                    if handle is not None and version > self.current_version:
+                        handle.read_into(self.weight_bytes).get()
+                        actual = int(self.weights[0].item())
+                        if actual >= version:
+                            self.current_version = actual
+                            print(f"[Gen {self.gen_id}] Synced to v{actual}")
                             sys.stdout.flush()
-
-                        # Step 2: Generate (only if we have weights)
-                        if self.current_version >= 0:
-                            await asyncio.sleep(gen_time)  # Simulate generation
-                            print(f"[Gen {self.gen_id}] Generated (v{self.current_version})")
-                            sys.stdout.flush()
-                            generations += 1
-                        else:
-                            # No weights yet, just wait a bit and try again
-                            await asyncio.sleep(0.05)
-
                     return self.current_version
 
-            # Spawn trainer and generators as separate meshes
+            # Spawn trainer and generators
             n_generators = 4
             trainer_proc = this_host().spawn_procs(per_host={"procs": 1})
             generator_procs = this_host().spawn_procs(per_host={"procs": n_generators})
@@ -854,23 +818,54 @@ def _(
 
             print("\n--- Running async RL simulation ---\n")
 
-            # Start generators FIRST (they'll wait for weights)
-            # This helps with timing - generators are ready when trainer starts publishing
-            gen_future = generators.run_loop.call(5, gen_time=0.25)  # 5 generations, 0.25s each
+            # Results storage
+            _results = {"trainer": None, "generators": [None] * n_generators}
 
-            # Then start trainer (slower steps to allow interleaving)
-            trainer_future = trainer.run_loop.call_one(6, step_time=1.)  # 6 train steps, 0.8s each
+            def run_trainer(n_steps, step_time):
+                import time
+                for _ in range(n_steps):
+                    time.sleep(step_time)
+                    _results["trainer"] = trainer.train_step.call_one().get()
+
+            def run_generator(gen_actor, gen_idx, n_iters, gen_time):
+                import time
+                for _ in range(n_iters):
+                    version = gen_actor.generate_step.call_one().get()
+                    if version >= 0:
+                        time.sleep(gen_time)
+                        print(f"[Gen {gen_idx}] Generated (v{version})")
+                    else:
+                        time.sleep(0.05)
+                _results["generators"][gen_idx] = version
+
+            # Create threads for trainer and each generator
+            threads = []
+
+            # Trainer thread
+            t = threading.Thread(target=run_trainer, args=(6, 1.0))  # 1 second per step
+            threads.append(t)
+
+            # Generator threads
+            for i in range(n_generators):
+                gen_actor = generators.slice(procs=i)
+                t = threading.Thread(target=run_generator, args=(gen_actor, i, 5, 0.25))
+                threads.append(t)
+
+            # Start all threads
+            for t in threads:
+                t.start()
 
             # Wait for all to complete
-            final_version = trainer_future.get()
-            gen_results = gen_future.get()
-            final_gen_versions = [v for _, v in gen_results.items()]
+            for t in threads:
+                t.join()
 
-            print(f"\n--- Done! Trainer published {final_version} versions ---")
-            print(f"→ Generators ended on versions: {final_gen_versions}")
-            print("→ All pulled independently via RDMA, weights verified!")
+            print(f"\n--- Done! Trainer published {_results['trainer']} versions ---")
+            print(f"Generators ended on versions: {_results['generators']}")
+            print("All pulled independently via RDMA, weights verified!")
 
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         print(f"(Demo failed: {e})")
         show_fallback()
     return
