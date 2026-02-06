@@ -14,13 +14,54 @@ def _():
 def _(mo):
     mo.md(r"""
     # Monarch: History & Vision
+    """)
+    return
 
-    What you'll learn:
 
-    1. Why Monarch exists (the tensor engine origin story)
-    2. The actor model and why it matters for distributed ML
-    3. How Monarch scales to millions of actors without a global routing table
+@app.cell
+def _(mo):
+    mo.md(r"""
+    ## Training at the Frontier Hurts
+
+    Before we look at any code, let's talk about **why Monarch exists**.
+
+    During Llama 3 pre-training, Meta ran 16,384 GPUs for 54 days and hit
+    **419 unexpected interruptions** — roughly one failure every 3 hours.
+    The breakdown tells you a lot about what goes wrong at scale:
+
+    | Cause | % of interruptions | Count |
+    |-------|-------------------|-------|
+    | Faulty GPUs | 30.1% | 148 |
+    | GPU HBM3 errors | 17.2% | 72 |
+    | Software bugs | 12.9% | 54 |
+    | Network / cables | 8.4% | 35 |
+    ...
+
+    This is "just" for 16K GPUs. If you further scale workloads to tens of thousands of GPUs, you should expect failures
+    every hour or more frequently. The distributed system must handle this gracefully — detect, checkpoint, recover, keep going
+    automatically, without requiring someone to SSH in to restart things manually.
+
+    **Monarch was built for this reality.** It's a PyTorch-native distributed
+    systems framework designed from the ground up for fault tolerance, flexible
+    communication patterns, and scale. Let's see how it got here.
+
+    *(Failure data from the [Llama 3 paper](https://arxiv.org/abs/2407.21783);
+    see also [Introducing PyTorch Monarch](https://pytorch.org/blog/introducing-pytorch-monarch/))*
+    """)
+    return
+
+
+@app.cell
+def _(mo):
+    mo.md(r"""
+    **What you'll learn:**
+
+    1. Why Monarch exists (the pain that drove its creation)
+    2. The tensor engine origin story
+    3. The actor model and why it matters for distributed ML
     4. Your first Monarch program: ping-pong actors
+    5. The Monarch ontology: World, Proc, Actor, Port
+    6. How Monarch scales
     """)
     return
 
@@ -30,15 +71,20 @@ def _(mo):
     mo.md(r"""
     ## The Tensor Engine Origin Story
 
-    Monarch began as a **tensor engine** for distributed PyTorch.
+    The first step toward solving this was rethinking how we orchestrate
+    distributed computation.
 
-    Key insight: **Single controller** vs SPMD (every rank runs same script)
+    Monarch began as a **tensor engine** for distributed PyTorch.
+    It was built as a "single controller" that executed DTensor operations.
+
+    In other words, in Monarch we have a **single controller** that orchestrates many GPUs,
+    instead of SPMD (Single Program, Multiple Data) where every rank runs the same script.
 
     ```
     ┌──────────────────────────────────────────────────────────────────┐
     │                    CONTROLLER (Python)                           │
     │                                                                  │
-    │   # Create a mesh: 4 hosts × 8 GPUs = 32 GPUs total              │
+    │   # Create a mesh: 4 hosts x 8 GPUs = 32 GPUs total              │
     │   mesh = DeviceMesh(hosts=4, gpus_per_host=8, dims=("dp", "tp")) │
     │                                                                  │
     │   with mesh.activate():                                          │
@@ -57,28 +103,9 @@ def _(mo):
        └─────────┘         └─────────┘         └─────────┘
     ```
 
-    **What makes this special:**
+    This allows one Python script to orchestrate thousands of GPUs - bypassing SPMD-imposed complexities like per-rank checks, scattered logging, etc. Complex control flow becomes more natural to express in code.
 
-    Monarch was designed as a **single-controller, DTensor-native** execution framework. One Python script on your laptop orchestrates thousands of GPUs - no SPMD rank-checking, no scattered logs.
-
-    **Example pipeline parallelism implementation:**
-
-    ```python
-    # Controller script - runs on one machine, orchestrates many
-    with pp_meshes[0].activate():
-        Y = Y.to_mesh(pp_meshes[-1])       # move data between pipeline stages
-        logits = model(X)
-        loss = loss_fn(logits, Y)
-
-    with mesh.activate():
-        for p in model.parameters():
-            p.grad.reduce_("dp", reduction="avg")  # all-reduce across data parallel
-        optimizer.step()
-    ```
-
-    The Tensor Engine still exists today but is no longer the only mode of execution - Monarch also exposes the underlying actor primitives directly.
-
-    **Key point:** Complex control flow (branching, loops, state machines) is natural in Monarch.
+    The tensor engine still exists today, but Monarch has evolved beyond it.
     """)
     return
 
@@ -88,47 +115,52 @@ def _(mo):
     mo.md(r"""
     ## Evolution to Actors
 
-    As we looked to support **RL workloads**, we discovered something:
+    While building the tensor engine, the Monarch team realized that the system
+    underneath — the Rust runtime managing processes, message routing, and
+    scheduling — was far more general than just tensor orchestration. The
+    **actor model** underpinning everything was powerful on its own.
 
-    The **actor model** that underpins the tensor engine design was more generalizable. RL systems need:
+    So the APIs shifted to bring those primitives directly to Python. Instead of
+    only exposing tensor operations, Monarch now lets you define arbitrary
+    **actors** that communicate via **messages**.
 
-    - Multiple heterogeneous actors (trainers, generators, reward models)
-    - Async communication patterns (not just all-reduce)
-    - Dynamic composition (add/remove actors at runtime)
+    **What is an actor?** In the formal sense, an actor is a concurrent unit of
+    computation that:
 
-    So Monarch evolved to bring those actor capabilities out to Python, ultimately becoming a **general-purpose, high-performance actor framework**.
+    1. Has **private state** — no shared memory with other actors
+    2. Communicates exclusively by **sending and receiving messages**
+    3. Can **create new actors**, send messages, and decide how to handle the next
+       message it receives
 
-    **What this means in practice:**
+    A useful analogy: think of actors as workers in separate offices. They can't
+    walk over and read each other's notebooks — they can only communicate by
+    passing notes through mail slots.
+
+    This model composes naturally with PyTorch's existing ecosystem. You can wrap any SPMD code with Monarch's actors,
+    and command a group or "gang" of actors as a single addressable unit, and wire them together however your workload requires.
+
+    Take RL for example (don't worry about the details of this snippet —
+    we'll cover these APIs hands-on throughout the series):
 
     ```python
-    # The tensor engine is still there for training
-    with mesh.activate():
-        loss = model(X)
-        loss.backward()
-        p.grad.reduce_("dp", reduction="avg")
-
-    # But now you can also build arbitrary actor systems
-    # Spawn actors across processes
+    # Spawn different actor types across processes
     host = this_host()
     trainer_procs = host.spawn_procs(per_host={"gpus": 1})
     generator_procs = host.spawn_procs(per_host={"gpus": 4})
-    reward_procs = host.spawn_procs(per_host={"gpus": 1})
 
     trainer = trainer_procs.spawn("trainer", TrainerActor)
     generators = generator_procs.spawn("generators", GeneratorActor)
-    reward_model = reward_procs.spawn("reward", RewardActor)
 
-    # Compose them however you want
+    # Wire them together
     for batch in training_loop:
-        # Call all generators (get list of results)
-        samples = generators.generate.call(prompts).get()
-        rewards = reward_model.score.call_one(samples).get()
-        trainer.train_step.call_one(samples, rewards).get()
+        # Call all generators (returns a ValueMesh)
+        sample_mesh = generators.generate.call(prompts).get()
+        # Extract values from the ValueMesh before passing along
+        samples = list(sample_mesh.values())
+        trainer.train_step.call_one(samples).get()
     ```
 
-    Monarch was designed with ambitions to run truly large-scale pre-training workloads. This requires support for millions of actors with serious attention to scaling and performance.
-
-    Let's demystify Monarch by looking at the architecture that underpins everything.
+    Let's make this concrete with a real program you can run.
     """)
     return
 
@@ -136,19 +168,52 @@ def _(mo):
 @app.cell
 def _(mo):
     mo.md(r"""
-    ## Hyperactor - The Rust Runtime
+    ## Your First Monarch Program
 
-    Hyperactor is the Rust actor runtime built on [Tokio](https://tokio.rs/), designed to scale to millions of actors.
+    The simplest possible Monarch program — two actors playing ping pong.
 
-    **Why Rust + Tokio:**
-
-    | Feature | Benefit |
-    |---------|---------|
-    | No GC pauses | Training can't afford stop-the-world |
-    | Lightweight async | Millions of actors per machine (not OS threads) |
-    | Work-stealing | Tokio balances load across cores |
-    | Memory safety | Rust prevents data races at compile time |
+    Reference: [ping_pong example](https://meta-pytorch.org/monarch/generated/examples/ping_pong.html)
     """)
+    return
+
+
+@app.cell
+def _():
+    from monarch.actor import Actor, endpoint, current_rank, this_host
+
+    class PingPong(Actor):
+        def __init__(self):
+            rank = current_rank().rank
+            self.name = "Ping" if rank == 0 else "Pong"
+            self.count = 0
+
+        @endpoint
+        def ping(self, message: str) -> str:
+            self.count += 1
+            print(f"{self.name} received: {message} (count: {self.count})")
+            return f"pong from {self.name}"
+
+    # Spawn two actors on separate processes
+    host = this_host()
+    procs = host.spawn_procs(per_host={"gpus": 2})
+    actors = procs.spawn("players", PingPong)
+
+    # Get individual actors via slicing
+    ping_actor = actors.slice(gpus=0)
+    pong_actor = actors.slice(gpus=1)
+
+    # Play ping pong — call_one targets a single actor
+    for i in range(3):
+        response = ping_actor.ping.call_one(f"round {i}").get()
+        print(f"Got: {response}")
+        response = pong_actor.ping.call_one(f"round {i}").get()
+        print(f"Got: {response}")
+
+    # .call() broadcasts to ALL actors and returns a ValueMesh — a dict-like
+    # container mapping each actor's position to its return value.
+    results = actors.ping.call("hello everyone").get()
+    for point, response in results.items():
+        print(f"Actor at {point}: {response}")
     return
 
 
@@ -157,31 +222,37 @@ def _(mo):
     mo.md(r"""
     ## The Monarch Ontology
 
-    The strict hierarchy that makes everything work:
+    Now that you've run code, let's name the pieces. Monarch has a strict
+    hierarchy:
 
     ```
     WORLD (gang-scheduled group of processes)
     ├── PROC 0 (single actor runtime instance)
-    │   ├── Actor "trainer"
-    │   │   ├── Port 0 (train endpoint)
-    │   │   ├── Port 1 (get_weights endpoint)
-    │   │   └── Port 2 (sync endpoint)
-    │   └── Actor "metrics"
-    │       └── Port 0 (report endpoint)
-    ├── PROC 1
-    │   └── Actor "generator_0"
-    │       ├── Port 0 (generate endpoint)
-    │       └── Port 1 (update_weights endpoint)
-    └── PROC 2
-        └── Actor "generator_1"
+    │   └── Actor "players" (pid=0, a.k.a. "Ping")
+    │       └── Port 0 (ping endpoint)
+    └── PROC 1
+        └── Actor "players" (pid=1, a.k.a. "Pong")
+            └── Port 0 (ping endpoint)
     ```
+
+    In Monarch, a **mesh** is a named, multi-dimensional collection of identical
+    resources that you can address and operate on as a group. A HostMesh contains
+    hosts, a ProcMesh contains processes, an ActorMesh contains actor instances —
+    each layer spawns the next.
 
     **Definitions:**
 
-    - **World**: Fixed group of processes scheduled together (gang scheduling)
-    - **Proc**: Single actor runtime instance, owns MailboxMuxer for local routing
-    - **Actor**: Independent async unit with its own mailbox, communicates only through messages
-    - **Port**: Typed message endpoint (`@endpoint` decorator creates a port)
+    - **World**: A fixed group of processes launched together via gang scheduling
+      (all processes start together as a group — if any fails to start, none do)
+    - **Proc**: A single actor runtime instance. One proc runs on one GPU (or CPU).
+    - **Actor**: An independent async unit with its own mailbox. Communicates only
+      through messages — never shares memory.
+    - **Port**: A typed message endpoint. Each `@endpoint` decorator creates a port.
+
+    In the ping-pong example above:
+    - The **World** is the group of 2 procs we spawned
+    - Each **Proc** hosts one PingPong **Actor**
+    - The `ping` method is a **Port**
     """)
     return
 
@@ -189,81 +260,29 @@ def _(mo):
 @app.cell
 def _(mo):
     mo.md(r"""
-    ## Why It Scales - Hierarchical Addressing
+    ## Why It Scales
 
-    Every entity has a hierarchical ID that **encodes the routing path**:
+    Monarch is designed to run millions of actors. Most actor systems use a
+    global routing table — Monarch doesn't. Instead, every entity has a
+    hierarchical ID that **encodes the routing path directly**:
 
     ```
     ActorId = (ProcId, actor_name, pid)
-    ProcId  = Ranked(WorldId, rank) | Direct(ChannelAddr, name)
+    ProcId  = Ranked(WorldId, rank)
     ```
 
-    **The full stack (HostMesh → ProcMesh → ActorMesh):**
+    A HostMesh contains hosts, each host runs procs (a ProcMesh), and each proc
+    hosts actors (an ActorMesh). The ActorId tells you exactly where to route
+    without any lookup:
 
     ```
-    ┌─────────────────────────────────────────────────────────────────────┐
-    │  HostMesh: hosts=4                                                  │
-    │  ┌─────────────┐ ┌─────────────┐ ┌─────────────┐ ┌─────────────┐    │
-    │  │   Host 0    │ │   Host 1    │ │   Host 2    │ │   Host 3    │    │
-    │  │  Agent @    │ │  Agent @    │ │  Agent @    │ │  Agent @    │    │
-    │  │  addr0:port │ │  addr1:port │ │  addr2:port │ │  addr3:port │    │
-    │  └──────┬──────┘ └──────┬──────┘ └──────┬──────┘ └──────┬──────┘    │
-    │         │               │               │               │           │
-    │  ┌──────┴───────────────┴───────────────┴───────────────┴──────┐    │
-    │  │  ProcMesh: WorldId("my_job"), procs_per_host=2              │    │
-    │  │                                                             │    │
-    │  │  Proc rank=0   Proc rank=1   Proc rank=2   ...  Proc rank=7 │    │
-    │  │  (host 0)      (host 0)      (host 1)           (host 3)    │    │
-    │  └─────────────────────────────────────────────────────────────┘    │
-    │                                                                     │
-    │  ActorMesh: actors spawned with full hierarchical addresses         │
-    │                                                                     │
-    │    my_job[0].worker[0]  my_job[2].worker[0]  my_job[4].worker[0]    │
-    │    my_job[0].worker[1]  my_job[2].worker[1]  my_job[4].worker[1]    │
-    │    my_job[1].trainer[0] my_job[3].trainer[0] ...                    │
-    └─────────────────────────────────────────────────────────────────────┘
+    Example: my_job[5].worker[3]
+
+      rank 5 -> host 2 (if 2 procs per host) -> dial addr2:port
+      Then local delivery to worker[3]'s mailbox: O(1)
     ```
 
-    **The key insight: ActorId encodes location**
-
-    ```
-    Example ActorId: my_job[5].worker[3]
-
-      ActorId(
-        ProcId::Ranked(WorldId("my_job"), rank=5),   ← Which proc (implies which host)
-        name="worker",                               ← Actor type
-        pid=3                                        ← Instance index
-      )
-
-    The rank encodes everything needed to route:
-      rank 5 → host 2 (if 2 procs per host) → dial addr2:port
-    ```
-
-    **Routing is the same at every layer:**
-
-    ```
-    ┌─────────────────────────────────────────────────────────────────────┐
-    │  Message from my_job[0].trainer[0] → my_job[5].worker[3]            │
-    │                                                                     │
-    │  Step 1: Extract ProcId from destination                            │
-    │          my_job[5] ← target proc                                    │
-    │                                                                     │
-    │  Step 2: Am I on proc 5?                                            │
-    │          NO → look up proc 5 in MailboxRouter (O(log procs))        │
-    │               Router has: my_job[5] → RemoteClient(addr2:port)      │
-    │                                                                     │
-    │  Step 3: Send to Host 2's agent                                     │
-    │          Agent routes to local proc 5                               │
-    │                                                                     │
-    │  Step 4: Proc 5's MailboxMuxer delivers locally                     │
-    │          O(1) DashMap lookup → worker[3]'s mailbox                  │
-    └─────────────────────────────────────────────────────────────────────┘
-
-    No central registry! The WorldId + rank tells you exactly where to go.
-    Multi-host routing uses the same principle as cross-proc routing.
-    ```
-
-    **Why this scales:**
+    **Why this beats a global table:**
 
     | Operation | Global Table | Monarch Hierarchical |
     |-----------|--------------|---------------------|
@@ -279,106 +298,22 @@ def _(mo):
 @app.cell
 def _(mo):
     mo.md(r"""
-    ## Per-Sender Message Ordering
-
-    Messages are delivered in per-sender FIFO order - critical for determinism without global locks.
-
-    ```
-    Multiple senders → One receiver
-
-    Sender A ──[M1]──[M3]──[M5]────┐
-                                   │
-    Sender B ──[M2]──[M4]───────┐  │    Actor X
-                                │  │    ┌─────────────────────┐
-    Sender C ──[M6]─────────┐   │  │    │ MailboxMuxer:       │
-                            │   │  │    │                     │
-                            │   │  │    │ A: [M1, M3, M5]     │
-                            └───┴──┴───►│ B: [M2, M4]         │
-                                        │ C: [M6]             │
-                                        │                     │
-                                        │ Fair dequeue:       │
-                                        │ M1, M2, M6, M3, M4..│
-                                        └─────────────────────┘
-
-    Per-sender FIFO: A's messages always in order (M1 < M3 < M5)
-    But A and B can interleave: M1, M2, M3, M4, M5...
-    ```
-
-    **How it works:**
-
-    1. Each sender has a separate queue per receiver
-    2. DashMap: `SenderId → MessageQueue` (no lock contention between senders)
-    3. Actor's event loop fairly drains all queues
-    4. Messages from same sender always delivered in order
-
-    **Why it matters:**
-
-    - Deterministic replay: same message sequence = same actor state
-    - No global sequencer bottleneck
-    - Scales to millions of concurrent senders
-    """)
-    return
-
-
-@app.cell
-def _(mo):
-    mo.md(r"""
-    ## Your First Monarch Program
-
-    Let's see the simplest possible Monarch program - two actors playing ping pong.
-
-    Reference: [ping_pong example](https://meta-pytorch.org/monarch/generated/examples/ping_pong.html)
-    """)
-    return
-
-
-@app.cell
-def _():
-    from monarch.actor import Actor, endpoint, current_rank, this_host
-
-    class PingPong(Actor):
-        def __init__(self, name: str):
-            self.name = name
-            self.count = 0
-
-        @endpoint
-        def ping(self, message: str) -> str:
-            self.count += 1
-            print(f"{self.name} received: {message} (count: {self.count})")
-            return f"pong from {self.name}"
-
-    # Spawn two actors on separate processes
-    host = this_host()
-    procs = host.spawn_procs(per_host={"gpus": 2})
-    actors = procs.spawn("players", PingPong, "Player")
-
-    # Get individual actors via slicing
-    alice = actors.slice(gpus=0)
-    bob = actors.slice(gpus=1)
-
-    # Play ping pong
-    for i in range(3):
-        response = alice.ping.call_one(f"ping {i} to Alice").get()
-        print(f"Got: {response}")
-        response = bob.ping.call_one(f"ping {i} to Bob").get()
-        print(f"Got: {response}")
-    return
-
-
-@app.cell
-def _(mo):
-    mo.md(r"""
     ## Summary
 
     **Key takeaways:**
 
-    1. **Single controller**: One Python script orchestrates distributed compute
-    2. **Tensor engine + actors**: Real tensor APIs (`to_mesh`, `reduce_`, `slice_mesh`) plus general actor patterns
-    3. **Hierarchical addressing**: O(1) local routing, no global registry
-    4. **Per-sender ordering**: Deterministic without global locks
+    1. **Born from pain**: Monarch was built for the reality of frontier training —
+       hundreds of failures across thousands of GPUs
+    2. **Single controller**: One Python script orchestrates distributed compute
+    3. **Actors, not threads**: Independent workers communicating via messages,
+       never sharing memory
+    4. **Hierarchical addressing**: O(1) local routing, no global registry, scales
+       to millions of actors
     5. **Rust + Tokio**: Performance without GC pauses
 
-    **Next:** Interactive DevX - using Monarch for fast distributed development
+    You've seen how Monarch's actors work. But right now, developing distributed
+    systems means SSH, submit, wait, check logs, repeat. What if you could iterate
+    as fast as local development? That's what we'll build next.
     """)
     return
 
