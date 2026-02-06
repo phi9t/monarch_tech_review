@@ -14,8 +14,8 @@ def _():
 def _():
     # Shared imports for the notebook
     import random
-    from monarch.actor import Actor, endpoint, current_rank, this_host
-    return Actor, current_rank, endpoint, random, this_host
+    from monarch.actor import Actor, endpoint, current_rank, MeshFailure, this_host
+    return Actor, MeshFailure, current_rank, endpoint, random, this_host
 
 
 @app.cell
@@ -23,43 +23,17 @@ def _(mo):
     mo.md(r"""
     # Fault Tolerance in Monarch
 
-    At scale, failures are constant. This notebook shows how to handle them gracefully.
+    In the last notebook, you caught a single error with try/except on a
+    FlakyWorker. That works when you know which actor failed and have a backup
+    ready. But when failures hit every 3 hours across 16,000 GPUs, you need
+    patterns that scale.
 
-    What you'll learn:
+    This notebook covers three layers of fault handling — from simple to
+    industrial:
 
-    1. The canonical try/except pattern (covers 90% of cases)
-    2. Supervision trees for centralized error surfacing
-    3. TorchFT integration for fault-tolerant training at scale
-    """)
-    return
-
-
-@app.cell
-def _(mo):
-    mo.md(r"""
-    ## When You're Running on Thousands of GPUs
-
-    Something is always failing:
-
-    - GPU memory errors (ECC, OOM)
-    - Network hiccups (transient, routing issues)
-    - Node crashes (hardware, kernel panics)
-    - Software bugs (race conditions, edge cases)
-
-    **The real cost:** A single undetected failure can burn millions of dollars. Silent failures are especially dangerous - your training looks fine but is actually diverging or stalled.
-
-    **The observability challenge:**
-    You need monitoring and observability at every layer to detect when systems are healthy or unhealthy. Of course, this is a prime target for automation.
-
-    **Why SPMD makes this hard:**
-    With traditional SPMD, automating failure detection and recovery is difficult:
-
-    - Making sense of thousands of ranks, each with their own view
-    - Plumbing through logs scattered across nodes
-    - Correlating failures across distributed processes
-    - No centralized place to catch and handle errors
-
-    **Monarch's approach:** Supervision trees provide centralized error surfacing. When an actor fails, the error bubbles up through a structured hierarchy - giving you one place to see what went wrong and why.
+    1. **Try/except with retry** — the 90% solution you'll reach for first
+    2. **Supervision trees** — centralized error surfacing for infrastructure builders
+    3. **TorchFT** — quorum-based training that continues through failures
     """)
     return
 
@@ -92,8 +66,7 @@ def _(Actor, current_rank, endpoint, random, this_host):
             return {"rank": self.rank, "result": data * 2, "calls": self.call_count}
 
     # Spawn workers
-    host = this_host()
-    procs = host.spawn_procs(per_host={"gpus": 3})
+    procs = this_host().spawn_procs(per_host={"gpus": 3})
     workers = procs.spawn("unreliable", UnreliableWorker, 0.3)
 
     # The canonical pattern: try/except with fallback
@@ -126,7 +99,7 @@ def _(mo):
     mo.md(r"""
     ## Why This Simple Pattern Works
 
-    Actors are **stateless from the caller's perspective**:
+    Actors are designed to be **stateless from the caller's perspective**:
 
     - If one fails, try another
     - The caller doesn't need to know implementation details
@@ -147,23 +120,120 @@ def _(mo):
     mo.md(r"""
     ## Supervision Trees: Centralized Error Surfacing
 
-    For infrastructure builders who want **centralized failure handling**.
+    Try/except works when the **caller** catches failures. But what about failures
+    you don't directly trigger — a child actor crashing in the background, a
+    cascading failure deep in a hierarchy?
 
-    The `__supervise__` hook intercepts child actor failures before they propagate.
-    Think of it as middleware for failure handling.
+    Monarch's answer is **supervision**. When an actor spawns children, it becomes
+    their supervisor. If a child fails, the supervisor's `__supervise__` method is
+    called with a `MeshFailure` describing what went wrong.
 
-    ```
-                        ┌─────────────┐
-                        │ Supervisor  │
-                        │             │
-                        │ __supervise__() ◄── failure event
-                        └──────┬──────┘           │
-                               │ spawns           │
-               ┌───────────────┼───────────────┐  │
-               ▼               ▼               ▼  │
-          [Worker 0]      [Worker 1]      [Worker 2]
-             ✓              ✗ FAIL ────────────┘
-    ```
+    Think of it like a management chain: when an employee hits a problem they can't
+    solve, it escalates to their manager. The manager can handle it (return `True`)
+    or escalate further (return `False`).
+    """)
+    return
+
+
+@app.cell
+def _(Actor, MeshFailure, endpoint, this_host):
+    import asyncio
+    import monarch.actor
+
+    class ActorCrash(BaseException):
+        """Inherits from BaseException (not Exception) to trigger actor death.
+        Regular Exceptions are application errors — returned to the caller,
+        actor stays alive. BaseException causes the actor to crash, which
+        triggers the supervision tree."""
+        pass
+
+    class FragileWorker(Actor):
+        """A worker that crashes when asked."""
+
+        @endpoint
+        async def do_work(self) -> str:
+            raise ActorCrash("GPU memory error on this worker!")
+
+    class Supervisor(Actor):
+        """Spawns and supervises children. Catches their failures automatically."""
+
+        def __init__(self, child_procs):
+            # Supervisor owns these children because it calls spawn()
+            self.workers = child_procs.spawn("fragile", FragileWorker)
+            self.failure_log = []
+            self._supervised = asyncio.Event()
+
+        def __supervise__(self, failure: MeshFailure) -> bool:
+            """Called automatically when an owned child actor fails."""
+            self.failure_log.append(str(failure))
+            print(f"[Supervisor] Caught failure: {failure}")
+            self._supervised.set()
+            return True  # Handled — don't propagate further
+
+        @endpoint
+        async def crash_a_child(self):
+            """Tell the child to crash, then wait for supervision to fire."""
+            self.workers.do_work.broadcast()  # fire-and-forget — triggers supervision
+            await asyncio.wait_for(self._supervised.wait(), timeout=30)
+
+        @endpoint
+        async def get_failure_log(self) -> list:
+            """Return failures caught by __supervise__ (as strings)."""
+            return list(self.failure_log)
+
+    # Override the default fault hook (which calls sys.exit) so unhandled
+    # supervision events don't kill our notebook
+    original_hook = monarch.actor.unhandled_fault_hook
+    monarch.actor.unhandled_fault_hook = lambda f: print(f"[Client] Unhandled fault: {f}")
+
+    # Create two separate proc meshes (supervisor and children MUST be on different meshes)
+    supervisor_procs = this_host().spawn_procs(per_host={"gpus": 1})
+    child_procs = this_host().spawn_procs(per_host={"gpus": 1})
+
+    # Spawn supervisor, passing child procs for it to own
+    supervisor = supervisor_procs.spawn("supervisor", Supervisor, child_procs)
+
+    # Tell supervisor to trigger the child — broadcast() means the error has
+    # no caller to return to, so the actor crashes and supervision fires
+    supervisor.crash_a_child.call_one().get()
+
+    # Query the supervisor's failure log
+    failures = supervisor.get_failure_log.call_one().get()
+    print(f"\n=== Supervisor's failure log ({len(failures)} entries) ===")
+    for j, f in enumerate(failures):
+        print(f"  [{j}] {f}")
+
+    if failures:
+        print("\n__supervise__ caught the child's failure automatically!")
+
+    # Restore original fault hook
+    monarch.actor.unhandled_fault_hook = original_hook
+    return
+
+
+@app.cell
+def _(mo):
+    mo.md(r"""
+    ### What Just Happened
+
+    The supervisor **owns** the `FragileWorker` because it called `spawn()`. When
+    the child raised `ActorCrash` (a `BaseException`), the actor died and Monarch
+    delivered a `MeshFailure` to the supervisor's `__supervise__` method.
+
+    **Why `BaseException`?** In Monarch, regular `Exception` subclasses are
+    application errors — they're returned to the caller and the actor stays alive.
+    `BaseException` subclasses signal a fatal crash: the actor dies, and the
+    supervision tree is notified.
+
+    Key points:
+
+    - `__supervise__` receives a `MeshFailure` with `.report()` for readable output
+    - Return `True` -> "I handled it" (stops propagation up the tree)
+    - Return `False` -> escalate to the supervisor's supervisor
+    - If no one handles it, the failure reaches the client as an unhandled fault
+
+    This gives you **one structured place** to see what went wrong — instead of
+    grepping through logs scattered across nodes.
     """)
     return
 
@@ -171,69 +241,42 @@ def _(mo):
 @app.cell
 def _(mo):
     mo.md(r"""
-    ### How Supervision Works
+    ### From One Supervisor to a Tree
 
-    When a child fails, the supervisor's `__supervise__` is called with:
+    You just saw a single supervisor catch one child's failure. Now imagine this
+    at scale — supervision forms a **tree** where failures propagate upward:
+
+    ```
+    Your Script (root)
+    └── Orchestrator
+        ├── TrainerSupervisor
+        │   ├── Trainer Rank 0  ✓
+        │   ├── Trainer Rank 1  ✓
+        │   └── Trainer Rank 2  ✗ OOM
+        └── GeneratorSupervisor
+            ├── Generator 0     ✓
+            └── Generator 1     ✓
+    ```
+
+    When Trainer Rank 2 crashes, `TrainerSupervisor.__supervise__` fires first.
+    If it returns `True`, the failure is handled locally — the Orchestrator never
+    even knows. If it returns `False`, the TrainerSupervisor itself fails, and the
+    event propagates up to the Orchestrator.
+
+    This is just like exception handling in a call stack:
 
     ```python
-    SupervisionEvent:
-      - actor_id: Which actor failed
-      - actor_status: Running | Stopped | Failed(error)
-      - occurred_at: Timestamp
-      - message_headers: Context from triggering message
+    try:                          # Orchestrator.__supervise__
+        try:                      # TrainerSupervisor.__supervise__
+            raise OOMError()      # Trainer Rank 2 crashes
+        except OOMError:          #   -> handle or re-raise
+            handle_or_reraise()
+    except Exception:             #   -> Orchestrator handles or crashes
+        handle_or_crash()
     ```
 
-    The supervisor can:
-
-    - **Return True**: "I handled it" (stops propagation)
-    - **Return False**: "Propagate up" (parent's `__supervise__` called)
-
-    ```python
-    class WorkerSupervisor(Actor):
-        def __init__(self):
-            self.failure_count = 0
-
-        async def __supervise__(self, event: SupervisionEvent) -> bool:
-            self.failure_count += 1
-            print(f"Caught failure #{self.failure_count}: {event.actor_id}")
-
-            if self.failure_count < 5:
-                print("  -> Handling locally (restarting worker)")
-                return True  # Handled - don't propagate
-            else:
-                print("  -> Too many failures, propagating up")
-                return False  # Propagate to our supervisor
-    ```
-    """)
-    return
-
-
-@app.cell
-def _(mo):
-    mo.md(r"""
-    ## Failure Chain Visibility
-
-    When failures propagate, Monarch maintains the full chain of causality:
-
-    ```
-    ERROR [orchestrator] Actor 'orchestrator' failed:
-      └─ UnhandledSupervisionEvent from 'trainer_controller':
-           └─ UnhandledSupervisionEvent from 'trainer_rank_3':
-                └─ ActorPanic: "CUDA out of memory allocating 2.1GB"
-                   at train_step() line 142
-                   message_id: "batch_12847"
-    ```
-
-    This gives you:
-
-    - **Root cause**: The actual error (OOM on rank 3)
-    - **Propagation path**: How the failure bubbled up
-    - **Context**: Which message triggered the failure
-    - **Actor identity**: Exact actor name and hierarchy
-
-    Traditional distributed systems show scattered logs. Monarch shows **one structured chain**.
-
-    Supervision trees help with error detection - they're foundational to how Monarch integrates with fault-tolerant training systems like TorchFT.
+    The payoff: instead of grepping through 16,000 log files, you get **one
+    structured chain** showing exactly what failed and how the failure propagated.
     """)
     return
 
@@ -243,19 +286,12 @@ def _(mo):
     mo.md(r"""
     ## TorchFT: Fault-Tolerant Training at Scale
 
-    **Why does fault tolerance matter at scale?**
+    Recall the 419 interruptions from Notebook 1 — at that scale, restarting
+    the entire job each time is unacceptable. You need training to **continue
+    with healthy replicas** while failed ones recover.
 
-    At large scales, failures become expected, not exceptional:
-
-    > In our Llama3 training runs we experienced **419 interruptions across a 54 day training window** for a 16k GPU training job. This averages to about **one failure every 3 hours**.
-    >
-    > If we project this out to 10s of thousands of GPUs, this represents a **failure once every hour or more frequently**.
-
-    (from [Introducing PyTorch Monarch](https://pytorch.org/blog/introducing-pytorch-monarch/))
-
-    Restarting the entire job for each of these failures will reduce the effective training time dramatically.
-
-    **TorchFT's approach:** Instead of stopping the whole job, continue training with the healthy replicas while failed ones recover.
+    The result: **60% faster recovery** than full SLURM restarts, with process
+    failures recovering in **~90 seconds**. Here's how.
     """)
     return
 
@@ -263,21 +299,10 @@ def _(mo):
 @app.cell
 def _(mo):
     mo.md(r"""
-    ## Approaches to Fault-Tolerant Training
+    ### How TorchFT Works
 
-    The solution is to make training tolerant of replica failures without stopping the entire job.
-
-    **TorchFT** (from PyTorch) provides a way to withstand GPU failures and allow training to continue.
-
-    **Strategy: Hybrid Sharded Data Parallelism**
-    Combines fault-tolerant DDP with FSDP v2 and Pipeline Parallelism.
-
-    On failure:
-
-    - Use torchcomms to catch collective-related errors and bubble them up through Monarch
-    - Continue training on the next batch without downtime
-    - Isolate failures to a single "replica group"
-    - Continue training with a subset of the original job (quorum shrinks)
+    TorchFT provides quorum-based training — instead of stopping the whole job
+    when a replica fails, the remaining replicas continue:
 
     ```
     Traditional Training:
@@ -302,6 +327,14 @@ def _(mo):
             Training continues without stopping
             Failed replica recovers and rejoins
     ```
+
+    On failure, TorchFT catches collective errors through its own
+    ManagedProcessGroup, isolates the failure to a single replica group, and
+    continues training without restarting the entire job.
+
+    A Lighthouse service (Rust gRPC) coordinates quorum membership via
+    heartbeats (~100ms), while a Manager handles checkpoint recovery when
+    replicas join or leave.
     """)
     return
 
@@ -309,61 +342,12 @@ def _(mo):
 @app.cell
 def _(mo):
     mo.md(r"""
-    ## How Monarch Integrates with TorchFT
+    ### Monarch + TorchFT: Separation of Concerns
 
-    Monarch and TorchFT have a clear separation of concerns:
-
-    **TorchFT: Step-Level Fault Tolerance**
-
-    - Lighthouse (Rust gRPC service) coordinates quorum membership via heartbeats (~100ms)
-    - Manager handles checkpoint recovery when replicas join/leave
-    - Training continues with reduced world size - no global stop
-
-    **Monarch: Orchestration-Level Recovery**
-
-    - Job allocation (SLURM) and process mesh spawning
-    - When a replica completely crashes, Monarch respins it with configurable retry logic
-    - First attempts fast process-level restarts, then escalates to new allocation if needed
-
-    **How they connect:**
-
-    1. Monarch spawns trainer processes and sets `TORCHFT_LIGHTHOUSE` env var
-    2. TorchFT trainers connect to Lighthouse using that address
-    3. If individual trainer crashes → Monarch's orchestration respins the replica
-    4. If GPU fails during a training step → TorchFT handles it via quorum shrink
-
-    ```
-    ┌─────────────────────────────────────────────────────────────┐
-    │              Monarch Orchestration Layer                    │
-    │                                                             │
-    │  Job Allocation          Replica Lifecycle                  │
-    │  ┌──────────────┐       ┌─────────────────────┐             │
-    │  │ SLURM /      │       │ Crash detected?     │             │
-    │  │ Allocation   │       │ → Respin replica    │             │
-    │  └──────────────┘       │ → Retry logic       │             │
-    │                         └─────────────────────┘             │
-    └─────────────────────────────────────────────────────────────┘
-                                  │
-                  ┌───────────────┼───────────────┐
-                  ▼               ▼               ▼
-            ┌──────────┐    ┌──────────┐    ┌──────────┐
-            │ Replica  │    │ Replica  │    │ Replica  │
-            │ Group 0  │    │ Group 1  │    │ Group 2  │
-            └────┬─────┘    └────┬─────┘    └────┬─────┘
-                 │               │               │
-                 └───────────────┼───────────────┘
-                                 ▼
-    ┌─────────────────────────────────────────────────────────────┐
-    │              TorchFT Fault Tolerance Layer                  │
-    │                                                             │
-    │  Lighthouse (gRPC)       Per-Step Recovery                  │
-    │  ┌──────────────┐       ┌─────────────────────┐             │
-    │  │ Heartbeats   │       │ Quorum shrink/grow  │             │
-    │  │ (~100ms)     │       │ Checkpoint transfer │             │
-    │  │ Quorum       │       │ No global stop      │             │
-    │  └──────────────┘       └─────────────────────┘             │
-    └─────────────────────────────────────────────────────────────┘
-    ```
+    TorchFT handles **step-level fault tolerance** — catching errors mid-training
+    and shrinking the quorum. Monarch handles **orchestration-level recovery** —
+    respawning crashed replicas, managing job allocation, and escalating from
+    fast process restarts to full reallocation when needed.
     """)
     return
 
@@ -371,14 +355,16 @@ def _(mo):
 @app.cell
 def _(mo):
     mo.md(r"""
-    ## Case Study: Qwen3-32B Training with Fault Injection
+    ### Case Study: Qwen3-32B Training with Fault Injection
 
-    We ran this code on a **30 node (240 H100s) Coreweave cluster**, using the SLURM scheduler to train Qwen3-32B using torchtitan and TorchFT.
+    We ran this on a **30 node (240 H100s) Coreweave cluster**, training
+    Qwen3-32B using torchtitan and TorchFT.
 
     **Test conditions:**
 
-    - 100 injected failures every 3 minutes
-    - Multiple failure modes: segfaults, process kills, NCCL abort, host eviction, GIL deadlock
+    - Failures injected at ~3-minute intervals, 100 total events
+    - Multiple failure modes: segfaults, process kills, NCCL abort, host
+      eviction, GIL deadlock
 
     **Results:**
 
@@ -389,7 +375,9 @@ def _(mo):
     | Avg recovery time (machine failures) | **2.5 minutes** |
 
     **Why the improvement?**
-    Monarch allows for configurable recovery strategies based on failure type — we avoid unnecessary job rescheduling by attempting fast process-level restarts first.
+    Monarch allows for configurable recovery strategies based on failure type —
+    we avoid unnecessary job rescheduling by attempting fast process-level
+    restarts first.
     """)
     return
 
@@ -402,21 +390,19 @@ def _(mo):
     **Key takeaways:**
 
     1. **Try/except first**: The canonical pattern covers 90% of cases
-    2. **Supervision trees**: Centralized error surfacing - one place to see what went wrong
-    3. **Quorum-based training**: Continue with healthy replicas while failed ones recover
-    4. **Monarch + TorchFT**: Orchestration-level recovery + step-level fault tolerance
+    2. **Supervision trees**: Centralized error surfacing — one place to see
+       what went wrong
+    3. **Quorum-based training**: Continue with healthy replicas while failed
+       ones recover
+    4. **Monarch + TorchFT**: Orchestration-level recovery + step-level fault
+       tolerance
 
-    **When to use what:**
+    These three patterns compose — try/except is your first line of defense,
+    supervision gives you visibility, and TorchFT handles training-specific
+    recovery at scale.
 
-    | Situation | Pattern |
-    |-----------|---------|
-    | Simple actor calls | Try/except |
-    | Building infrastructure | Supervision trees |
-    | Massive scale training | TorchFT + Monarch |
-
-    **Coming up:** In the Services notebook, we'll see the try/except pattern in action - building a generator pool that routes around failures and recovers unhealthy replicas.
-
-    **Next:** Async RL - putting it all together with services, RDMA, and async loops
+    We've built patterns to handle failures. Next: putting it all together —
+    services, weight sync, and async RL loops.
     """)
     return
 
