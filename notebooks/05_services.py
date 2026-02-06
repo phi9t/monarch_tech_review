@@ -13,263 +13,143 @@ def _():
 @app.cell
 def _(mo):
     mo.md(r"""
-    # Services: Building a Generator Pool
+    # Services: Managing Worker Pools
 
-    We just introduced async RL and why it matters. If you've used Claude Code or any coding-capable AI, you know that depending on the difficulty of your question, it could take a really long time to generate even one trajectory. As we showed in the previous notebook, there's also significant variance in how long generation takes.
+    In the last notebook, we saw how generation variance makes synchronous RL
+    wasteful — the trainer sits idle waiting for the slowest generator. The fix
+    is running many generators in parallel, decoupled from training.
 
-    For this reason, you'll typically want to run RL workloads with **many generator replicas running in parallel**.
-
-    ## The "Service" Abstraction
-
-    When you get to this point, there are a few ways you could model this. A pretty natural approach is to create a **"service"**.
-
-    In traditional software engineering, a service is a component that:
-    - Handles requests from clients
-    - Can be replicated for throughput and reliability
-    - Lives behind some kind of load balancer (think Kubernetes)
-
-    This idea applies here too. You *could* find and grab an off-the-shelf implementation, but since we're always working in Python, it would be nice to have a **Python-native implementation** - especially one you can easily customize to match your needs as an RL researcher.
-
-    ## What We'll Build
-
-    There are a lot of ideas that could go into a service, but what we'll focus on implementing here - using **pure Monarch** - is a service that can:
-
-    1. **Load balance** across replicas (round-robin for simplicity, but you could implement more exotic strategies based on your workload)
-    2. **Track and respond to faults** (health tracking, retry with different replica)
-    3. **Be discoverable** (services register themselves, clients find them by name)
-    4. **Support multi-GPU replicas** (each replica is an ActorMesh that can span multiple GPUs)
-    5. **Target specific replicas** (grab a replica and keep using it - useful for stateful interactions)
-
-    Since each replica is an ActorMesh, everything we build here *could* run multi-host - the abstraction supports it. For this tutorial, we'll run on a single node to keep things simple.
-    """)
-    return
-
-
-@app.cell
-def _(mo):
-    mo.md(r"""
-    ## Quick Recap: Monarch Actors
-
-    Before we dive in, a quick refresher on the Monarch primitives we'll use. If you've gone through the earlier notebooks, you'll recognize these:
-
-    - **`@endpoint`** - Marks a method as callable from other actors. Returns a `Future` that you `.get()` to await.
-    - **`__supervise__`** - Called when a child actor fails. You can log the error and decide whether to handle it.
-    - **`get_or_spawn_controller`** - Gets or creates a singleton actor by name. First caller spawns it, subsequent callers get the existing one.
-    - **`ActorMesh`** - A group of actors spawned together. When you call an endpoint, it runs on all actors in the mesh.
-
-    With that in mind, let's think about what API we want for our service.
-    """)
-    return
-
-
-@app.cell
-def _(mo):
-    mo.md(r"""
-    ## A Key Assumption: 1 Replica = 1 ActorMesh
-
-    Most workloads we care about will need to span multiple GPUs. A 70B model needs tensor parallelism across 8 GPUs. Models like DeepSeek V3 may need to span multiple *hosts*.
-
-    So rather than treating single-GPU replicas as the default and multi-GPU as a special case, we'll make a basic assumption: **1 replica = 1 ActorMesh**.
-
-    This means:
-    - Each replica is a group of workers (an ActorMesh)
-    - Workers within a replica coordinate via **collectives** - each replica is its own distributed "world"
-    - The service manages replicas, not individual workers
-
-    This design composes naturally with the existing ML ecosystem. A common pattern might be to plug **vLLM** or another inference engine into one of these meshes - it just sees a standard distributed environment.
-
-    If you happen to have a small model that fits on one GPU, you just have a replica with 1 worker. The abstraction still works.
-    """)
-    return
-
-
-@app.cell
-def _(mo):
-    mo.md(r"""
-    ## Designing the API First
-
-    Before we implement anything, let's sketch what we want the usage to look like. This helps us work backwards to the implementation.
-
-    **What a client wants to do:**
-    ```python
-    # Get a service by name
-    gen_service = get_service("generators")
-
-    # Get a replica and call it
-    replica, replica_idx = gen_service.get_replica_with_idx()
-    result = replica.generate(task)
-
-    # If something fails, mark it unhealthy and retry
-    gen_service.mark_unhealthy(replica_idx)
-    ```
-
-    **What a service wants to do on startup:**
-    ```python
-    # Register itself so clients can find it
-    register_service("generators", self)
-    ```
-
-    This gives us a clean separation: services register themselves, clients discover them by name. You *can* pass actor references around directly - that works fine - but referring to services by name is often a cleaner pattern, especially when services and clients are spawned independently.
-    """)
-    return
-
-
-@app.cell
-def _(mo):
-    mo.md(r"""
-    ## Service Discovery: The Registry Pattern
-
-    Let's implement the discovery mechanism first. We'll create a `ServiceRegistry` singleton and wrap it with helper functions.
+    But managing a pool of workers brings its own problems. Let's see what
+    happens when you try to do it by hand.
     """)
     return
 
 
 @app.cell
 def _():
-    from monarch.actor import Actor, endpoint, get_or_spawn_controller
+    import random
+    from monarch.actor import Actor, endpoint, current_rank, this_host, get_or_spawn_controller
+    return (
+        Actor,
+        current_rank,
+        endpoint,
+        get_or_spawn_controller,
+        random,
+        this_host,
+    )
 
-    class ServiceRegistry(Actor):
-        """
-        Singleton registry for service discovery.
 
-        Found via get_or_spawn_controller("service_registry", ServiceRegistry).
-        First caller spawns it, subsequent callers get the existing one.
-        """
+@app.cell
+def _(Actor, current_rank, endpoint, random):
+    class Worker(Actor):
+        """A worker that processes requests. May fail randomly."""
 
-        def __init__(self):
-            self.services: dict[str, Actor] = {}
-            print("[REGISTRY] ServiceRegistry spawned")
-
-        @endpoint
-        def register(self, name: str, service) -> None:
-            """Register a service by name."""
-            self.services[name] = service
-            print(f"[REGISTRY] Registered '{name}'")
-
-        @endpoint
-        def get(self, name: str):
-            """Get a service by name."""
-            if name not in self.services:
-                raise KeyError(f"Service '{name}' not found")
-            return self.services[name]
+        def __init__(self, fail_rate: float = 0.0):
+            self.rank = current_rank().rank
+            self.fail_rate = fail_rate
+            self.calls = 0
 
         @endpoint
-        def list_services(self) -> list[str]:
-            """List all registered service names."""
-            return list(self.services.keys())
+        def ping(self) -> bool:
+            return True
+
+        @endpoint
+        def process(self, data: str) -> str:
+            """Process a request. Might fail based on fail_rate."""
+            self.calls += 1
+            if random.random() < self.fail_rate:
+                raise RuntimeError(f"Worker failed!")
+            return f"Processed '{data}'"
+    return (Worker,)
 
 
-    def _get_registry():
-        """Get the singleton ServiceRegistry."""
-        return get_or_spawn_controller("service_registry", ServiceRegistry).get()
+@app.cell
+def _(Worker, this_host):
+    # === The Manual Approach ===
+    host = this_host()
+    procs = host.spawn_procs(per_host={"procs": 4})
 
+    # Spawn 4 workers on individual proc slices
+    manual_workers = []
+    for i in range(4):
+        w = procs.slice(procs=i).spawn(f"w_{i}", Worker, fail_rate=0.3)
+        manual_workers.append(w)
 
-    def get_service(name: str):
-        """Get a service by name. Raises KeyError if not found."""
-        registry = _get_registry()
-        return registry.get.call_one(name).get()
+    # Manual round-robin with manual failure tracking
+    healthy = list(range(4))
+    current_idx = 0
 
+    print("=== Manual Worker Management ===")
+    for req in range(6):
+        if not healthy:
+            print(f"  Request {req}: No workers left!")
+            break
 
-    def register_service(name: str, service) -> None:
-        """Register a service so others can find it by name."""
-        registry = _get_registry()
-        registry.register.call_one(name, service).get()
+        worker_idx = healthy[current_idx % len(healthy)]
+        try:
+            result = manual_workers[worker_idx].process.call_one(f"req_{req}").get()
+            print(f"  Request {req}: Worker {worker_idx} -> OK")
+            current_idx += 1
+        except Exception:
+            print(f"  Request {req}: Worker {worker_idx} FAILED — removing from pool")
+            healthy.remove(worker_idx)
+            # But is it really dead? Or just a transient error?
+            # How do we check later? When do we add it back?
 
-
-    def list_services() -> list[str]:
-        """List all registered service names."""
-        registry = _get_registry()
-        return registry.list_services.call_one().get()
-    return Actor, endpoint, get_service, register_service
+    print(f"\n{len(healthy)}/4 workers still in pool")
+    print("Questions:")
+    print("  Who checks if failed workers recovered?")
+    print("  What if multiple clients need this same pool?")
+    print("  What if we have 50 workers across 10 nodes?")
+    return (host,)
 
 
 @app.cell
 def _(mo):
     mo.md(r"""
-    Now clients can simply call:
-    ```python
-    gen_service = get_service("generators")
-    ```
+    ## The Problems with Manual Management
 
-    And services register themselves with:
-    ```python
-    register_service("generators", self)
-    ```
+    That works for 4 workers in a notebook. But at scale:
 
-    The registry is a singleton - `get_or_spawn_controller` ensures everyone gets the same one.
+    - **Shared state**: Multiple clients need the same pool, but each tracks
+      its own `healthy` list — when one client discovers a failure, others
+      don't know
+    - **Recovery**: No mechanism to check if failed workers come back
+    - **Discovery**: Clients must know exactly which workers exist at spawn time
+    - **Multi-GPU replicas**: A 70B model needs tensor parallelism across 8
+      GPUs — each "replica" is a group of workers, not a single process
 
-    ## The Worker: Where the Actual Work Happens
-
-    Let's define a worker actor. Each worker knows:
-    - Its **replica ID** - which replica it belongs to (passed at spawn time)
-    - Its **local rank** - its position within the replica's ActorMesh (0, 1, 2, ...)
+    The fix: centralize pool management in a **Service** actor. Since it's an
+    actor, its state (which replicas are healthy, the round-robin index) is
+    automatically shared across all callers — no duplicate tracking.
     """)
     return
 
 
 @app.cell
-def _(Actor, endpoint):
-    from monarch.actor import current_rank
-
-    class Worker(Actor):
-        """A worker that does work. Knows its replica ID and local rank."""
-
-        def __init__(self, replica_id: int, fail_rate: float = 0.0):
-            self.replica_id = replica_id
-            # Local rank within this replica's ActorMesh
-            self.local_rank = current_rank().rank  # 0, 1, 2, ... within this replica
-            self.fail_rate = fail_rate
-            self.calls = 0
-            print(f"[WORKER] Replica {replica_id}, local rank {self.local_rank} ready")
-
-        @endpoint
-        def ping(self) -> bool:
-            """Health check endpoint. Returns True if the worker is alive."""
-            return True
-
-        @endpoint
-        def process(self, data: str) -> dict:
-            """Process some data. Might fail based on fail_rate."""
-            import random
-            self.calls += 1
-
-            if random.random() < self.fail_rate:
-                raise RuntimeError(f"Worker failed! (replica={self.replica_id}, local={self.local_rank})")
-
-            return {
-                "replica_id": self.replica_id,
-                "local_rank": self.local_rank,
-                "calls": self.calls,
-                "result": f"Processed '{data}' by replica {self.replica_id}",
-            }
-
-        @endpoint
-        def get_replica_id(self) -> int:
-            """Return which replica this worker belongs to."""
-            return self.replica_id
-
-        @endpoint
-        def get_local_id(self) -> int:
-            """Return this worker's local rank within its replica."""
-            return self.local_rank
-    return (Worker,)
-
-
-@app.cell
 def _(mo):
     mo.md(r"""
-    The **local rank** is the worker's position within its ActorMesh (0, 1, 2, ...). This is how workers within a replica coordinate - for example, rank 0 might handle the first shard of a tensor-parallel model.
+    ## The Service Actor
 
-    The **replica ID** is passed at spawn time so workers know which replica they belong to. This is useful for logging and debugging.
+    The Service centralizes everything the manual approach did ad-hoc:
 
-    ## The Service: Routing and Health Tracking
+    1. Takes a `worker_class` and a ProcMesh, slices it into replica-sized
+       chunks, and spawns an ActorMesh on each
+    2. Routes requests round-robin across healthy replicas
+    3. Tracks health — callers mark replicas unhealthy, the Service can
+       probe for recovery
 
-    Now let's build the service that manages replicas. It needs to:
-    - Slice a ProcMesh into replica-sized chunks
-    - Spawn an ActorMesh for each replica (passing the replica ID)
-    - Route requests round-robin to healthy replicas
-    - Track which replicas are healthy
-    - Handle failures via `__supervise__`
+    We treat **1 replica = 1 ActorMesh** — each replica can span multiple
+    GPUs for tensor parallelism. If your model fits on one GPU, a replica is
+    just size 1.
+
+    The methods fall into three groups:
+
+    - **Routing**: `get_replica()` / `get_replica_with_idx()` — round-robin
+      across healthy replicas
+    - **Health**: `mark_unhealthy()` / `check_health()` — callers report
+      failures, Service probes for recovery
+    - **Lifecycle**: `__init__` slices the ProcMesh and spawns workers
     """)
     return
 
@@ -277,127 +157,98 @@ def _(mo):
 @app.cell
 def _(Actor, endpoint):
     class Service(Actor):
-        """
-        Manages a pool of worker replicas with routing and health tracking.
+        """Manages a pool of worker replicas with routing and health tracking.
 
-        Each replica is an ActorMesh (potentially spanning multiple GPUs/hosts).
-        The service:
-        1. Slices resources into replica-sized chunks
-        2. Spawns an ActorMesh per replica
-        3. Routes requests round-robin to healthy replicas
-        4. Tracks health and handles failures
-        5. Can probe unhealthy replicas to check if they've recovered
+        The Service owns worker lifecycle: it slices a ProcMesh into
+        replica-sized chunks and spawns an ActorMesh on each.
         """
 
         def __init__(
             self,
             service_name: str,
             worker_class: type,
-            replica_procs,
-            procs_per_replica: int,
-            **worker_kwargs
+            procs,
+            procs_per_replica: int = 1,
+            **worker_kwargs,
         ):
             self.service_name = service_name
-            total_procs = len(replica_procs)
-            self.num_replicas = total_procs // procs_per_replica
-            self.procs_per_replica = procs_per_replica
+            total = len(procs)
+            self.num_replicas = total // procs_per_replica
 
-            # Slice the proc mesh into replica-sized chunks
+            # Slice ProcMesh and spawn a replica on each chunk
             self.replicas = []
             for i in range(self.num_replicas):
                 start = i * procs_per_replica
                 end = start + procs_per_replica
-
-                # Slice out this replica's procs
-                replica_slice = replica_procs.slice(procs=slice(start, end))
-
-                # Spawn an ActorMesh on this slice, passing replica_id
-                replica_mesh = replica_slice.spawn(
-                    f"replica_{i}",
-                    worker_class,
-                    replica_id=i,  # Pass replica ID to workers
-                    **worker_kwargs
+                replica_slice = procs.slice(procs=slice(start, end))
+                replica = replica_slice.spawn(
+                    f"replica_{i}", worker_class, **worker_kwargs,
                 )
-                self.replicas.append(replica_mesh)
+                self.replicas.append(replica)
 
-            # Track health: healthy and unhealthy sets
             self.healthy = set(range(self.num_replicas))
             self.unhealthy: set[int] = set()
-
-            # Round-robin index
             self.next_idx = 0
 
-            print(f"[SERVICE:{service_name}] {self.num_replicas} replicas × {procs_per_replica} procs each")
+            print(f"[SERVICE:{service_name}] {self.num_replicas} replicas "
+                  f"x {procs_per_replica} procs each")
 
-        def __supervise__(self, failure) -> bool:
-            """Called when a worker fails. Log it."""
-            report = failure.report()
-            print(f"[SERVICE:{self.service_name}] Failure detected: {report[:100]}...")
-            return True  # Handled - real recovery is caller retrying with different replica
+        # --- Routing ---
 
         @endpoint
         def get_replica(self):
-            """Get a healthy replica (round-robin selection)."""
+            """Get a healthy replica (round-robin)."""
             if not self.healthy:
                 raise RuntimeError("No healthy replicas available!")
-
             healthy_list = sorted(self.healthy)
             idx = self.next_idx % len(healthy_list)
             self.next_idx += 1
-
             return self.replicas[healthy_list[idx]]
 
         @endpoint
         def get_replica_with_idx(self):
-            """Get a healthy replica and its index (for marking unhealthy later)."""
+            """Get (replica, index). Use the index for mark_unhealthy()."""
             if not self.healthy:
                 raise RuntimeError("No healthy replicas available!")
-
             healthy_list = sorted(self.healthy)
             idx = self.next_idx % len(healthy_list)
             self.next_idx += 1
-
             replica_idx = healthy_list[idx]
             return self.replicas[replica_idx], replica_idx
 
+        # --- Health tracking ---
+
         @endpoint
         def mark_unhealthy(self, replica_idx: int) -> None:
-            """Mark a replica as unhealthy."""
+            """Remove a replica from rotation."""
             if replica_idx in self.healthy:
                 self.healthy.discard(replica_idx)
                 self.unhealthy.add(replica_idx)
-                print(f"[SERVICE:{self.service_name}] Replica {replica_idx} marked unhealthy. "
+                print(f"[SERVICE:{self.service_name}] Replica {replica_idx} unhealthy. "
                       f"Healthy: {len(self.healthy)}/{self.num_replicas}")
 
         @endpoint
         def mark_healthy(self, replica_idx: int) -> None:
-            """Mark a replica as healthy again."""
+            """Reinstate a replica."""
             if replica_idx < self.num_replicas:
                 self.unhealthy.discard(replica_idx)
                 self.healthy.add(replica_idx)
 
         @endpoint
         def check_health(self) -> dict:
-            """
-            Probe all unhealthy replicas to see if they've recovered.
-            Returns a dict with recovery results.
-            """
+            """Probe unhealthy replicas. Reinstate those that respond to ping()."""
             recovered = []
             still_unhealthy = []
-
             for replica_idx in list(self.unhealthy):
                 try:
-                    # Ping the replica to see if it's alive
-                    self.replicas[replica_idx].ping.call_one().get()
-                    # Success - mark healthy
+                    # Use .call() not .call_one() — works for multi-GPU replicas too
+                    self.replicas[replica_idx].ping.call().get()
                     self.unhealthy.discard(replica_idx)
                     self.healthy.add(replica_idx)
                     recovered.append(replica_idx)
                     print(f"[SERVICE:{self.service_name}] Replica {replica_idx} recovered!")
                 except Exception:
-                    # Still unhealthy
                     still_unhealthy.append(replica_idx)
-
             return {
                 "recovered": recovered,
                 "still_unhealthy": still_unhealthy,
@@ -413,6 +264,17 @@ def _(Actor, endpoint):
                 "healthy_indices": sorted(self.healthy),
                 "unhealthy_indices": sorted(self.unhealthy),
             }
+
+        # --- Lifecycle ---
+
+        @endpoint
+        def get_all_replicas(self) -> list:
+            """Get all replicas (for operations that touch every replica)."""
+            return list(self.replicas)
+
+        @endpoint
+        def ping(self) -> bool:
+            return True
     return (Service,)
 
 
@@ -421,66 +283,108 @@ def _(mo):
     mo.md(r"""
     Key design decisions:
 
-    1. **1 replica = 1 ActorMesh** - Each replica can span multiple GPUs (or even hosts)
-    2. **Pass replica_id at spawn** - Workers know which replica they belong to
-    3. **Caller registers the service** - After spawning, the caller calls `register_service()`. We can't do this in `__init__` because actors can't block on Futures during initialization.
-    4. **Round-robin routing** - Simple, predictable, works well when replicas are similar
-    5. **Caller marks unhealthy** - The service doesn't automatically detect which replica failed. Instead, the caller tells it after catching an exception.
-    6. **Health probes for recovery** - Workers have a `ping()` endpoint. The service's `check_health()` method probes unhealthy replicas and recovers them if they respond.
-    7. **`__supervise__`** - Monarch calls this when a child actor fails. We log it, but the real handling is the caller retrying with a different replica.
-
-    ## Let's Run It!
-
-    Let's create a simple demo that shows:
-    - Different replicas being called (round-robin)
-    - What happens when a replica fails
-    - How the service routes around failures
-    - How health checks recover replicas
+    - **Service spawns workers** — it takes a `worker_class` and a ProcMesh,
+      slices it into replica-sized chunks, and spawns an ActorMesh on each.
+      Because the Service owns the lifecycle, it could also respawn failed
+      replicas.
+    - **Caller marks unhealthy** — the Service doesn't auto-detect failures.
+      The caller catches the exception and tells the Service. This is the same
+      try/except pattern from notebook 03.
+    - **Caller registers** — we call `register_service()` after spawning
+      because actors can't block on Futures during `__init__`.
     """)
     return
 
 
 @app.cell
-def _(Service, Worker, register_service):
-    # Demo: Create a service with 4 replicas, 1 worker each
-    # We'll send 8 requests to see round-robin in action
+def _(mo):
+    mo.md(r"""
+    ## Service Discovery
 
-    from monarch.actor import this_host
+    Multiple parts of the system need the same services — the trainer needs
+    generators, the orchestrator needs the trainer. Rather than threading
+    references everywhere, we use a **singleton registry**. Monarch's
+    `get_or_spawn_controller` guarantees exactly one exists across all
+    processes.
+    """)
+    return
 
-    # Get procs on this host
-    host = this_host()
 
-    # The Service itself is an actor, so it needs to be spawned on a proc
-    service_proc = host.spawn_procs({"procs": 1})
+@app.cell
+def _(Actor, endpoint, get_or_spawn_controller):
+    class ServiceRegistry(Actor):
+        """Singleton registry for service discovery."""
 
-    # Procs for the worker replicas
-    worker_procs = host.spawn_procs({"procs": 4})
+        def __init__(self):
+            self.services: dict[str, Actor] = {}
+            print("[REGISTRY] ServiceRegistry spawned")
 
-    # Spawn the service actor
-    demo_service = service_proc.spawn(
-        "demo_service",
-        Service,
+        @endpoint
+        def register(self, name: str, service) -> None:
+            self.services[name] = service
+            print(f"[REGISTRY] Registered '{name}'")
+
+        @endpoint
+        def get(self, name: str):
+            if name not in self.services:
+                raise KeyError(f"Service '{name}' not found")
+            return self.services[name]
+
+        @endpoint
+        def list_services(self) -> list[str]:
+            return list(self.services.keys())
+
+
+    def _get_registry():
+        return get_or_spawn_controller("service_registry", ServiceRegistry).get()
+
+    def get_service(name: str):
+        """Get a service by name."""
+        return _get_registry().get.call_one(name).get()
+
+    def register_service(name: str, service) -> None:
+        """Register a service for discovery."""
+        _get_registry().register.call_one(name, service).get()
+
+    def list_services() -> list[str]:
+        """List all registered services."""
+        return _get_registry().list_services.call_one().get()
+    return get_service, list_services, register_service
+
+
+@app.cell
+def _(mo):
+    mo.md(r"""
+    ## Seeing It Work
+
+    First, the happy path — 4 replicas, no failures. Watch the round-robin
+    distribute requests evenly.
+    """)
+    return
+
+
+@app.cell
+def _(Service, Worker, host, register_service):
+    # === Demo 1: Round-Robin Routing ===
+    svc_proc = host.spawn_procs(per_host={"procs": 1})
+    worker_procs_demo = host.spawn_procs(per_host={"procs": 4})
+
+    demo_svc = svc_proc.spawn(
+        "demo_svc", Service,
         service_name="demo",
         worker_class=Worker,
-        replica_procs=worker_procs,
+        procs=worker_procs_demo,
         procs_per_replica=1,
-        fail_rate=0.0,  # No failures for now
+        fail_rate=0.0,
     )
+    register_service("demo", demo_svc)
 
-    # Register the service so it can be discovered by name
-    register_service("demo", demo_service)
-
-    # Send 8 requests - should round-robin through replicas 0,1,2,3,0,1,2,3
-    print("Round-robin demo:")
-    for _i in range(8):
-        replica, replica_idx = demo_service.get_replica_with_idx.call_one().get()
-        result = replica.process.call_one(f"request_{_i}").get()
-        print(f"  Request {_i}: handled by replica {result['replica_id']}")
-
-    # Note: In production you'd call worker_procs.stop() and service_proc.stop()
-    # to clean up, but there's currently a Monarch bug where stopping procs
-    # can crash the kernel if there are lingering references.
-    return (host,)
+    print("=== Round-Robin Demo ===")
+    for req_num in range(4):
+        worker, idx = demo_svc.get_replica_with_idx.call_one().get()
+        response = worker.process.call_one(f"req_{req_num}").get()
+        print(f"  Request {req_num}: replica {idx} -> {response}")
+    return
 
 
 @app.cell
@@ -488,70 +392,90 @@ def _(mo):
     mo.md(r"""
     ### Handling Failures
 
-    Now let's see what happens when a replica fails. We'll create a service with a 30% failure rate and watch the retry logic in action. Then we'll use `check_health()` to recover replicas.
+    Now with a 30% failure rate. The pattern: try, catch, `mark_unhealthy`,
+    retry with a different replica. Then `check_health` to probe for recovery.
     """)
     return
 
 
 @app.cell
 def _(Service, Worker, host, register_service):
-    # Create a service with a failure rate
-    # Service needs its own proc, workers need their procs
-    flaky_service_proc = host.spawn_procs({"procs": 1})
-    flaky_worker_procs = host.spawn_procs({"procs": 4})
+    # === Demo 2: Failure Handling + Recovery ===
+    flaky_svc_proc = host.spawn_procs(per_host={"procs": 1})
+    flaky_worker_procs = host.spawn_procs(per_host={"procs": 4})
 
-    flaky_service = flaky_service_proc.spawn(
-        "flaky_service",
-        Service,
-        service_name="flaky_demo",
+    flaky_svc = flaky_svc_proc.spawn(
+        "flaky_svc", Service,
+        service_name="flaky",
         worker_class=Worker,
-        replica_procs=flaky_worker_procs,
+        procs=flaky_worker_procs,
         procs_per_replica=1,
-        fail_rate=0.3,  # 30% failure rate
+        fail_rate=0.3,
     )
+    register_service("flaky", flaky_svc)
 
-    # Register the service
-    register_service("flaky_demo", flaky_service)
-
-    # Try to process with retry
     def process_with_retry(svc, data, max_retries=3):
+        """The canonical pattern: try/except + mark_unhealthy + retry."""
         for attempt in range(max_retries):
-            replica, replica_idx = svc.get_replica_with_idx.call_one().get()
+            replica, idx = None, None
             try:
-                result = replica.process.call_one(data).get()
-                print(f"  Success on replica {replica_idx}")
-                return result
-            except Exception as e:
-                print(f"  Attempt {attempt+1} failed on replica {replica_idx}: {e}")
-                svc.mark_unhealthy.call_one(replica_idx).get()
+                replica, idx = svc.get_replica_with_idx.call_one().get()
+                return replica.process.call_one(data).get()
+            except Exception:
+                if idx is not None:
+                    print(f"    Attempt {attempt + 1}: replica {idx} failed")
+                    svc.mark_unhealthy.call_one(idx).get()
+                else:
+                    print(f"    Attempt {attempt + 1}: no healthy replicas")
         raise RuntimeError("All retries exhausted")
 
-    # Process several requests
-    print("Failure handling demo:")
-    for _j in range(5):
-        print(f"Request {_j}:")
+    print("=== Failure Handling Demo ===")
+    for j in range(5):
+        print(f"  Request {j}:")
         try:
-            process_with_retry(flaky_service, f"data_{_j}")
+            _result = process_with_retry(flaky_svc, f"data_{j}")
+            print(f"    Success: {_result}")
         except RuntimeError as e:
-            print(f"  {e}")
+            print(f"    {e}")
 
-    # Check health status after failures
-    status = flaky_service.get_health_status.call_one().get()
-    print(f"\nAfter failures: {status['healthy']}/{status['total']} replicas healthy")
-    print(f"Unhealthy replicas: {status['unhealthy_indices']}")
+    # Check health after failures
+    status = flaky_svc.get_health_status.call_one().get()
+    print(f"\nAfter failures: {status['healthy']}/{status['total']} healthy")
+    print(f"Unhealthy: {status['unhealthy_indices']}")
 
-    # Now run health checks to recover replicas
-    # (In our case, the replicas are still alive - they just had random failures)
-    print("\nRunning health check to recover replicas...")
-    recovery = flaky_service.check_health.call_one().get()
+    # Recover — workers are still alive, they just had transient errors
+    print("\nProbing unhealthy replicas...")
+    recovery = flaky_svc.check_health.call_one().get()
     print(f"Recovered: {recovery['recovered']}")
-    print(f"Still unhealthy: {recovery['still_unhealthy']}")
 
-    # Check health status after recovery
-    status_after = flaky_service.get_health_status.call_one().get()
-    print(f"\nAfter health check: {status_after['healthy']}/{status_after['total']} replicas healthy")
+    status_after = flaky_svc.get_health_status.call_one().get()
+    print(f"Now: {status_after['healthy']}/{status_after['total']} healthy")
     return
 
+
+@app.cell
+def _(mo):
+    mo.md(r"""
+    ### Discovery in Action
+
+    A completely separate part of the system can find services by name —
+    no need to pass actor references around.
+    """)
+    return
+
+
+@app.cell
+def _(get_service, list_services):
+    # === Demo 3: Service Discovery ===
+    print("=== Service Discovery Demo ===")
+    print(f"Registered services: {list_services()}")
+
+    # Find the demo service by name — no reference needed
+    discovered = get_service("demo")
+    found_worker = discovered.get_replica.call_one().get()
+    discovery_result = found_worker.process.call_one("found via discovery!").get()
+    print(f"Discovered 'demo' service, got: {discovery_result}")
+    return
 
 
 @app.cell
@@ -559,28 +483,32 @@ def _(mo):
     mo.md(r"""
     ## What We Built
 
-    A simple but complete service framework:
-
     | Component | Responsibility |
     |-----------|---------------|
-    | **`get_service(name)`** | Find a service by name |
-    | **`register_service(name, svc)`** | Register a service for discovery |
-    | **Worker** | Does the actual work, knows its replica_id and local_rank |
-    | **Service** | Owns replicas (ActorMeshes), routes requests, tracks health |
+    | **Worker** | Processes requests, has `ping()` for health checks |
+    | **Service** | Spawns replicas, routes round-robin, tracks health |
+    | **ServiceRegistry** | Singleton for discovery (`get_service("name")`) |
 
     The pattern:
-    1. Services register themselves on startup with `register_service()`
-    2. Clients discover services with `get_service()`
+    1. Allocate procs and spawn a Service (which spawns its own workers)
+    2. Register the service so clients can discover it by name
     3. Clients get replicas, make calls, handle failures inline
-    4. On failure, mark unhealthy and retry with a different replica
+    4. On failure: `mark_unhealthy` + retry with a different replica
+    5. Periodically: `check_health` to recover transient failures
+
+    This Service class lives in `src/monarch_utils/services.py` — in notebook
+    07, we'll import it and use it to manage real generator workers.
 
     ## What's Missing?
 
-    The generators need **updated weights** after the trainer takes a gradient step. Right now they'd be using stale weights forever.
+    The generators need **updated weights** after the trainer takes a gradient
+    step. Right now they'd use stale weights forever.
 
-    How do we efficiently sync weights from trainer to generators?
+    How do we efficiently move hundreds of megabytes of model weights from
+    trainer to generators — without blocking training?
 
-    **Next notebook: RDMA Weight Sync** - Using Monarch's RDMA primitives to transfer weights without blocking training.
+    **Next: RDMA Weight Sync** — using Monarch's RDMA primitives for direct
+    GPU-to-GPU weight transfer.
     """)
     return
 
