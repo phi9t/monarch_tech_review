@@ -17,7 +17,15 @@ def _():
     import torch
     from monarch.actor import Actor, endpoint, this_host, current_rank
     from monarch.rdma import RDMABuffer, is_rdma_available
-    return Actor, RDMABuffer, endpoint, is_rdma_available, this_host, torch
+    return (
+        Actor,
+        RDMABuffer,
+        current_rank,
+        endpoint,
+        is_rdma_available,
+        this_host,
+        torch,
+    )
 
 
 @app.cell
@@ -25,22 +33,32 @@ def _(mo):
     mo.md(r"""
     # RDMA & Weight Synchronization
 
-    This notebook explores efficient weight synchronization for async RL systems.
+    You've built your async RL system. Generators are humming, the trainer is
+    learning. Then you check GPU utilization and discover that most of your
+    "training" time is spent copying weights. Your async system has become a
+    weight-syncing system that occasionally does RL.
 
-    **Outline:**
-
-    1. **Why Weight Sync Matters** - On-policy vs off-policy, model scale
-    2. **The Bandwidth Hierarchy** - NVLink, InfiniBand, PCIe
-    3. **The Problem: Collectives Are Blocking** - Why RL needs something different
-    4. **The Magic Pointer Pattern** - Control plane vs data plane separation
-    5. **CPU Staging** - Decoupling trainer and generator timing
-    6. **Circular Weight Buffers** - Versioning without memory churn
-    7. **Weight Re-sharding** - Handling different tensor layouts
-    8. **Putting It All Together** - Live demo with concurrent loops
+    This notebook is about making that problem disappear — using RDMA to move
+    weights from trainer to generators so fast it becomes invisible.
 
     **Want to go deeper?** Check out **06b_weight_sync_deep_dive.py** for ibverbs internals,
     memory registration benchmarks, and full implementations. This notebook focuses on
     the concepts and patterns you need to know for async RL.
+    """)
+    return
+
+
+@app.cell
+def _(mo):
+    mo.md(r"""
+    ### Prerequisites
+
+    This notebook assumes familiarity with:
+
+    - **PyTorch basics** - tensors, dtypes, device placement
+    - **On-policy vs off-policy RL** - covered in [NB04: Async RL](./04_async_rl.py)
+    - **Monarch Actor model** - spawning actors, endpoints, `call_one`/`call` (from [NB01](./01_history_and_vision.py) and [NB02](./02_interactive_devx.py))
+    - **Basic networking concepts** - what bandwidth and latency mean, client-server vs peer-to-peer
     """)
     return
 
@@ -110,7 +128,18 @@ def _(mo):
     mo.md(r"""
     ## 2. The Bandwidth Hierarchy
 
-    Modern HPC clusters have multiple interconnects with vastly different bandwidths:
+    For weight sync, we care about one specific data path — trainer GPU to generator
+    GPU, across nodes. Here's the chain of interconnects a weight tensor traverses:
+
+    ```
+    Trainer GPU ──PCIe──► CPU ──PCIe──► NIC ══RDMA══► NIC ──PCIe──► CPU ──PCIe──► Generator GPU
+      same node     (64 GB/s)    (50 GB/s)     (64 GB/s)      same node
+    ```
+
+    The bottleneck is the cross-node RDMA link at 50 GB/s per NIC. But modern nodes
+    have **8 NICs** (one per GPU), so aggregate cross-node bandwidth is 400 GB/s.
+
+    Here's how all these interconnects fit together in a full node:
 
     ```
     ┌──────────────────────────────────────────────────────────────────────────────────────────────────────────┐
@@ -126,8 +155,8 @@ def _(mo):
     │                                              │                                                           │
     │                                         ======  64 GB/s PCIe                                             │
     │                                              │                                                           │
-    │    ┌─────────┐  ------ 48 GB/s ------ ┌──────┴──┐                  ┌───────┐          ┌───────┐          │
-    │    │  CPU 0  │     CPU interconnect   │  CPU 1  │ ====== 64 GB/s ══│ NIC 0 │          │ NIC 1 │          │
+    │    ┌─────────┐                        ┌──────┴──┐                  ┌───────┐          ┌───────┐          │
+    │    │  CPU 0  │                        │  CPU 1  │ ====== 64 GB/s ══│ NIC 0 │          │ NIC 1 │          │
     │    └────┬────┘                        └────┬────┘      PCIe        └───┬───┘          └───┬───┘          │
     │         │                                  │                           │                  │              │
     │         ══════════════════════ 64 GB/s PCIe ═══════════════════════════╪══════════════════╪              │
@@ -135,7 +164,7 @@ def _(mo):
     └────────────────────────────────────────────────────────────────────────┼──────────────────┼──────────────┘
                                                                              │                  │
                                                                            ======  50 GB/s   ======
-                                                                        IB NDR400         IB NDR400
+                                                                      RDMA (IB/RoCE)   RDMA (IB/RoCE)
                                                                              │                  │
                                                             ┌────────────────┴──────────────────┴────────────────┐
                                                             │                                                    │
@@ -144,15 +173,15 @@ def _(mo):
                                                             └────────────────┬──────────────────┬────────────────┘
                                                                              │                  │
                                                                            ======  50 GB/s   ======
-                                                                        IB NDR400         IB NDR400
+                                                                      RDMA (IB/RoCE)   RDMA (IB/RoCE)
                                                                              │                  │
     ┌────────────────────────────────────────────────────────────────────────┼──────────────────┼──────────────┐
     │                                                                        │                  │              │
     │         ══════════════════════ 64 GB/s PCIe ═══════════════════════════╪══════════════════╪              │
     │         │                                  │                           │                  │              │
     │    ┌────┴────┐                        ┌────┴────┐      PCIe        ┌───┴───┐          ┌───┴───┐          │
-    │    │  CPU 0  │     CPU interconnect   │  CPU 1  │ ====== 64 GB/s ══│ NIC 0 │          │ NIC 1 │          │
-    │    └─────────┘ ------ 48 GB/s ------  └─────────┘                  └───────┘          └───────┘          │
+    │    │  CPU 0  │                        │  CPU 1  │ ====== 64 GB/s ══│ NIC 0 │          │ NIC 1 │          │
+    │    └─────────┘                        └─────────┘                  └───────┘          └───────┘          │
     │                                              │                                                           │
     │                                           ======  64 GB/s PCIe                                           │
     │                                              │                                                           │
@@ -169,7 +198,7 @@ def _(mo):
     Bandwidth encoding (line intensity):
       ########  NVLink/NVSwitch   900 GB/s bidirectional (GPU ↔ GPU, same node)
       ========  PCIe Gen5 / RDMA  50-64 GB/s unidirectional (CPU↔GPU, CPU↔NIC, cross-node)
-      --------  CPU interconnect  48 GB/s (CPU ↔ CPU, same node)
+      (Showing 2 of 8 NICs for clarity — each GPU has a dedicated NIC)
     ```
 
     ### A Note on Bandwidth Numbers
@@ -205,8 +234,14 @@ def _(mo):
 
     **Rule of thumb**: NVLink for same-node ops (gradients, activations).
     RDMA for cross-node communication (weight sync) - it's the only practical option.
+    """)
+    return
 
-    ### Back-of-Envelope: Syncing Large Models
+
+@app.cell
+def _(mo):
+    mo.md(r"""
+    ### 2b. Back-of-Envelope: Syncing Large Models
 
     Let's do some quick math. DeepSeek V3 has 671B parameters (~1.34 TB in bf16).
 
@@ -293,6 +328,9 @@ def _(mo):
 
     This is what RDMA enables: **one-sided memory operations**.
     The trainer doesn't even know when generators pull weights - this is truly async!
+
+    RDMA isn't just "faster TCP" — it bypasses the kernel entirely. No socket buffers,
+    no context switches, no serialization. The NIC reads directly from registered memory.
     """)
     return
 
@@ -429,8 +467,17 @@ def _(mo):
     # Generator side: receive handle, pull directly into GPU
     handle = trainer.get_weight_handle.call_one().get()  # Tiny message
     gpu_weights = model.weights.view(torch.uint8).flatten()
-    handle.read_into(gpu_weights).get()                   # Bulk RDMA → GPU
+    handle.read_into(gpu_weights).get()                   # Bulk RDMA transfer
+
+    # Push model: caller writes local src_tensor into the remote RDMABuffer
+    buffer.write_from(src_tensor).get()
     ```
+
+    **Pull vs Push**: `read_into` is the **pull** model (generator reads remote data into
+    its local buffer), while `write_from` is the **push** model (caller writes local data
+    into the remote buffer). Both are one-sided RDMA operations — the remote side is not
+    involved. In async RL, pull is more natural because each generator decides *when* it
+    needs fresh weights.
 
     **Want to understand how RDMA works under the hood?** Check out **06b_weight_sync_deep_dive.py**
     for ibverbs internals, queue pair setup, and why Monarch's actor model is such a natural fit
@@ -534,25 +581,29 @@ def _(mo):
     mo.md(r"""
     ## 5. CPU Staging Pattern
 
-    ### GPU-Native RDMA Works!
+    ### GPU-Native RDMA Exists (and Monarch Supports It)
 
-    First, let's be clear: **GPU-native RDMA works** and is fast:
-    - GPUDirect RDMA: NIC reads directly from GPU memory
-    - No CPU copy needed (when hardware supports it)
-    - Great for synchronous transfers
+    GPU-native RDMA (GPUDirect) is real and works well - the NIC reads directly from GPU
+    memory with no CPU copy. Monarch supports this at the Rust level. For synchronous
+    bulk transfers, it's excellent.
 
-    ### Why CPU Staging for Async RL?
+    ### CPU Staging: A Deliberate Architectural Choice
+
+    For async RL, CPU staging isn't a workaround for missing GPUDirect - it's the
+    **preferred production pattern**. The reason is **temporal decoupling**: trainers
+    and generators operate on completely independent timelines, and we need a buffer
+    between them.
 
     The issue isn't bandwidth - it's **timing**:
 
     ```
     Direct GPU→GPU RDMA:
-    ┌─────────────────────────────────────────────────────┐
+    ┌──────────────────────────────────────────────────────┐
     │ Generator GPU is mid-inference                       │
-    │ ├── layer 1 ──┤ [RDMA arrives, needs sync!]         │
+    │ ├── layer 1 ──┤ [RDMA arrives, needs sync!]          │
     │               ↓                                      │
     │         cudaDeviceSynchronize()  ← Blocks inference! │
-    └─────────────────────────────────────────────────────┘
+    └──────────────────────────────────────────────────────┘
     ```
 
     With CPU staging, nothing on the critical path blocks:
@@ -567,6 +618,10 @@ def _(mo):
     ```
 
     The CPU buffer is a **temporal decoupling point**.
+
+    Note: the CPU staging path does involve GPU↔CPU copies on each end. When we say
+    RDMA is "zero-copy," we mean across the network — the NIC reads/writes directly
+    from/to registered CPU memory with no kernel involvement.
     """)
     return
 
@@ -576,14 +631,33 @@ def _(mo):
     mo.md(r"""
     ## 6. Circular Weight Buffers
 
-    ### The Versioning Problem
+    ### One-Sided Isn't Free
 
-    In async RL, trainer updates weights continuously. Generators need to:
-    1. **Grab the latest** weights (not stale ones)
-    2. **Not block** waiting for updates
-    3. **Avoid memory churn** (re-registering RDMA buffers is expensive)
+    One-sided RDMA is powerful - trainers and generators can operate independently without
+    explicit send/recv coordination. But "no coordination" isn't quite right. There's still
+    a fundamental race condition lurking: **what if the trainer overwrites a buffer while a
+    generator is reading from it?**
 
-    ### Solution: Circular Buffer
+    With a single buffer, this is a real problem:
+
+    ```
+    Trainer: write v3 to buffer ──────────►  [buffer: v3...v2...v3]  ← corrupted!
+    Generator: reading v2 from buffer ────►  read gets mix of v2 and v3
+    ```
+
+    We need *some* form of coordination. The question is: do we go back to message-passing
+    (explicit locks, barriers, acknowledgments) and lose the async benefits? Or can we get
+    coordination from the **structure itself**?
+
+    ### Solution: Circular Buffer as Structural Coordination
+
+    The key insight: GPU memory is scarce, but **CPU memory is abundant**. We can afford to
+    keep multiple versions of the weights in CPU staging buffers. By writing to slots in a
+    circular pattern, the trainer never overwrites a slot that a generator might still be
+    reading - as long as we have enough slots to cover the timing gap.
+
+    This is **structural coordination**: the circular buffer's design eliminates the race
+    condition without any explicit synchronization messages between trainer and generator.
 
     ```
     Trainer writes:     v0    →  v1  →  v2  →  v3  →  v4  →  v5  → ...
@@ -595,16 +669,132 @@ def _(mo):
     ```
 
     Benefits:
+    - **No message-based coordination** - structure prevents races, not locks
     - **Pre-registered RDMA buffers** - no memory registration on hot path
     - **Lock-free reads** - generators always get a consistent snapshot
     - **Bounded memory** - only N versions in flight
 
-    The key insight: register all slots at init time, then just write to them.
-    No allocation, no registration on the critical path.
+    **Memory cost is real**: for a 70B model (140 GB in bf16), 5 slots = 700 GB of CPU RAM.
+    This is feasible on HPC nodes (Grand Teton has ~1.5 TB RAM per node), but `n_slots` is
+    bounded by available CPU memory, not just timing.
+
+    The key design constraint: register all slots at init time, then just write to them.
+    No allocation, no registration on the critical path. Tune `n_slots` so that the trainer
+    can't lap the slowest generator — if it does, the generator reads a corrupted mix of
+    two versions (not a graceful error, just silent data corruption).
 
     **Want to see a full implementation?** Check out **06b_weight_sync_deep_dive.py** for a
     complete `CircularWeightBuffer` class with versioning and RDMA integration.
     """)
+    return
+
+
+@app.cell
+def _(mo):
+    circ_slots_slider = mo.ui.slider(1, 8, value=3, label="Buffer slots (n_slots)")
+    circ_writes_slider = mo.ui.slider(1, 10, value=2, label="Trainer writes per generator sync")
+    mo.vstack([
+        mo.md("**Try it**: adjust slots and write speed to see when lapping causes a race condition."),
+        mo.hstack([circ_slots_slider, circ_writes_slider], justify="center", gap=1),
+    ])
+    return circ_slots_slider, circ_writes_slider
+
+
+@app.cell
+def _(circ_slots_slider, circ_writes_slider, mo):
+    _n = circ_slots_slider.value
+    _w = circ_writes_slider.value
+    _safe = _w < _n
+
+    # Build SVG showing circular buffer slots with write pointer and read pointer
+    _slot_w, _slot_h = 64, 48
+    _gap = 6
+    _pad = 30
+    _total_w = max(_n * (_slot_w + _gap) - _gap + 2 * _pad, 300)
+    _total_h = 130
+
+    _parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{_total_w}" height="{_total_h}" '
+        f'style="font-family: -apple-system, sans-serif;">'
+    ]
+
+    # Title
+    _parts.append(
+        f'<text x="{_total_w / 2}" y="18" text-anchor="middle" '
+        f'font-size="12" fill="#666">Trainer writes {_w} version{"s" if _w != 1 else ""} '
+        f'while generator reads from slot 0</text>'
+    )
+
+    _slot_y = 50
+    for _i in range(_n):
+        _x = _pad + _i * (_slot_w + _gap)
+
+        # Which trainer write steps land on this slot?
+        # Trainer writes to slots 1, 2, ..., wrapping around
+        _write_steps = [j + 1 for j in range(_w) if (1 + j) % _n == _i]
+        _is_gen_read = (_i == 0)
+        _is_written = len(_write_steps) > 0
+        _collision = _is_gen_read and _is_written
+
+        # Colors
+        if _collision:
+            _fill, _stroke = "#fecaca", "#dc2626"
+        elif _is_gen_read:
+            _fill, _stroke = "#dbeafe", "#2563eb"
+        elif _is_written:
+            _fill, _stroke = "#dcfce7", "#16a34a"
+        else:
+            _fill, _stroke = "#f3f4f6", "#9ca3af"
+
+        # Slot rectangle
+        _parts.append(
+            f'<rect x="{_x}" y="{_slot_y}" width="{_slot_w}" height="{_slot_h}" rx="5" '
+            f'fill="{_fill}" stroke="{_stroke}" stroke-width="2"/>'
+        )
+        # Slot label
+        _parts.append(
+            f'<text x="{_x + _slot_w / 2}" y="{_slot_y + _slot_h / 2}" text-anchor="middle" '
+            f'dominant-baseline="central" font-size="13" font-weight="bold" '
+            f'fill="{_stroke}">slot {_i}</text>'
+        )
+        # Write step markers above slot
+        if _write_steps:
+            _step_label = ",".join(str(s) for s in _write_steps)
+            _marker_color = "#dc2626" if _collision else "#16a34a"
+            _parts.append(
+                f'<text x="{_x + _slot_w / 2}" y="{_slot_y - 8}" text-anchor="middle" '
+                f'font-size="10" fill="{_marker_color}">write #{_step_label}</text>'
+            )
+        # Generator reading label below slot 0
+        if _is_gen_read:
+            _gen_label = (
+                "▲ gen reading — OVERWRITTEN!" if _collision else "▲ gen reading"
+            )
+            _gen_color = "#dc2626" if _collision else "#2563eb"
+            _gen_weight = "bold" if _collision else "normal"
+            _parts.append(
+                f'<text x="{_x + _slot_w / 2}" y="{_slot_y + _slot_h + 16}" '
+                f'text-anchor="middle" font-size="10" font-weight="{_gen_weight}" '
+                f'fill="{_gen_color}">{_gen_label}</text>'
+            )
+
+    _parts.append("</svg>")
+    _svg = "\n".join(_parts)
+
+    if _safe:
+        _callout = mo.callout(mo.md(
+            f"**Safe** — {_n} slots, {_w} trainer writes between generator reads. "
+            f"Generator finishes reading slot 0 before trainer wraps around to overwrite it."
+        ), kind="success")
+    else:
+        _callout = mo.callout(mo.md(
+            f"**RACE CONDITION** — {_n} slots, {_w} trainer writes per generator read. "
+            f"Trainer wraps around and overwrites slot 0 on write #{_n} while generator is "
+            f"still reading it! Result: corrupted weights (silent data corruption, not an error).\n\n"
+            f"**Fix**: increase to at least **{_w + 1} slots**."
+        ), kind="danger")
+
+    mo.vstack([mo.Html(_svg), _callout])
     return
 
 
@@ -664,6 +854,353 @@ def _(mo):
 
 
 @app.cell
+def _():
+    from dataclasses import dataclass
+    from typing import List, Tuple
+
+    @dataclass
+    class ShardMetadata:
+        """Metadata describing a tensor shard."""
+        rank: int
+        global_shape: Tuple[int, ...]
+        offset: Tuple[int, ...]  # Start position in global tensor
+        local_shape: Tuple[int, ...]  # Shape of this shard
+
+    @dataclass
+    class TransferChunk:
+        """A chunk to transfer from sender to receiver."""
+        sender_rank: int
+        receiver_rank: int
+        sender_offset: Tuple[int, int]  # Where to read from sender
+        receiver_offset: Tuple[int, int]  # Where to write in receiver
+        shape: Tuple[int, int]  # Shape of the chunk
+
+    def compute_shard_metadata(
+        global_shape: Tuple[int, int],
+        num_ranks: int,
+        shard_dim: int,
+    ) -> List[ShardMetadata]:
+        """Compute shard metadata for a given sharding."""
+        shards = []
+        dim_size = global_shape[shard_dim]
+        shard_size = dim_size // num_ranks
+
+        for rank in range(num_ranks):
+            offset = [0, 0]
+            local_shape = list(global_shape)
+
+            offset[shard_dim] = rank * shard_size
+            local_shape[shard_dim] = shard_size
+
+            shards.append(ShardMetadata(
+                rank=rank,
+                global_shape=global_shape,
+                offset=tuple(offset),
+                local_shape=tuple(local_shape),
+            ))
+
+        return shards
+
+    def compute_overlap(
+        sender: ShardMetadata,
+        receiver: ShardMetadata,
+    ) -> "TransferChunk | None":
+        """Compute overlap between sender and receiver shards."""
+        s_start = sender.offset
+        s_end = (s_start[0] + sender.local_shape[0], s_start[1] + sender.local_shape[1])
+
+        r_start = receiver.offset
+        r_end = (r_start[0] + receiver.local_shape[0], r_start[1] + receiver.local_shape[1])
+
+        inter_start = (max(s_start[0], r_start[0]), max(s_start[1], r_start[1]))
+        inter_end = (min(s_end[0], r_end[0]), min(s_end[1], r_end[1]))
+
+        if inter_start[0] >= inter_end[0] or inter_start[1] >= inter_end[1]:
+            return None
+
+        shape = (inter_end[0] - inter_start[0], inter_end[1] - inter_start[1])
+
+        sender_local = (inter_start[0] - s_start[0], inter_start[1] - s_start[1])
+        receiver_local = (inter_start[0] - r_start[0], inter_start[1] - r_start[1])
+
+        return TransferChunk(
+            sender_rank=sender.rank,
+            receiver_rank=receiver.rank,
+            sender_offset=sender_local,
+            receiver_offset=receiver_local,
+            shape=shape,
+        )
+
+    def compute_transfer_plan(
+        sender_shards: List[ShardMetadata],
+        receiver_shards: List[ShardMetadata],
+    ) -> List[TransferChunk]:
+        """Compute all transfers needed for re-sharding."""
+        transfers = []
+        for sender in sender_shards:
+            for receiver in receiver_shards:
+                chunk = compute_overlap(sender, receiver)
+                if chunk is not None:
+                    transfers.append(chunk)
+        return transfers
+
+    def render_resharding_svg(trainer_shards, gen_shards, transfer_plan, global_shape):
+        """Render a color-matched visualization of the re-sharding transfer plan.
+
+        Returns HTML string with:
+        - Two grids (trainer left, generator right) where each transfer chunk
+          is colored the same on both sides so you can visually match them.
+        - A transfer matrix table below showing which chunks move where.
+        """
+        # Layout constants
+        grid_w, grid_h = 280, 240
+        left_x, right_x = 80, 520
+        top_y = 50
+        svg_w = 880
+        rows, cols = global_shape
+
+        # Generate distinct colors for each transfer
+        # Use HSL with evenly spaced hues for maximum distinction
+        n_transfers = len(transfer_plan)
+        transfer_colors = []
+        for i in range(max(n_transfers, 1)):
+            hue = (i * 360 // max(n_transfers, 1) + 10) % 360
+            transfer_colors.append(f"hsl({hue}, 70%, 55%)")
+
+        # Also need light shard background colors (just for shard boundaries)
+        shard_border_color = "#444"
+
+        parts = []
+        svg_h = top_y + grid_h + 50
+        parts.append(
+            f'<svg xmlns="http://www.w3.org/2000/svg" width="{svg_w}" height="{svg_h}" '
+            f'viewBox="0 0 {svg_w} {svg_h}" '
+            f'style="font-family: -apple-system, sans-serif; font-size: 12px;">'
+        )
+
+        # Title labels
+        parts.append(f'<text x="{left_x + grid_w // 2}" y="22" text-anchor="middle" '
+                      f'font-weight="bold" font-size="15">Trainer shards</text>')
+        parts.append(f'<text x="{right_x + grid_w // 2}" y="22" text-anchor="middle" '
+                      f'font-weight="bold" font-size="15">Generator shards</text>')
+
+        # Subtitle showing shard dim
+        t_dim = "row" if (trainer_shards and trainer_shards[0].offset == (0, 0)
+                          and len(trainer_shards) > 1
+                          and trainer_shards[1].offset[0] > 0) else "col"
+        g_dim = "row" if (gen_shards and gen_shards[0].offset == (0, 0)
+                          and len(gen_shards) > 1
+                          and gen_shards[1].offset[0] > 0) else "col"
+        parts.append(f'<text x="{left_x + grid_w // 2}" y="38" text-anchor="middle" '
+                      f'font-size="11" fill="#666">{len(trainer_shards)} GPUs, {t_dim}-sharded</text>')
+        parts.append(f'<text x="{right_x + grid_w // 2}" y="38" text-anchor="middle" '
+                      f'font-size="11" fill="#666">{len(gen_shards)} GPUs, {g_dim}-sharded</text>')
+
+        # Helper: map global (row, col, h, w) to pixel rect
+        def to_px(base_x, r, c, h, w):
+            px = base_x + (c / cols) * grid_w
+            py = top_y + (r / rows) * grid_h
+            pw = (w / cols) * grid_w
+            ph = (h / rows) * grid_h
+            return px, py, pw, ph
+
+        # Draw transfer chunks as colored rectangles on BOTH grids
+        for i, t in enumerate(transfer_plan):
+            color = transfer_colors[i]
+
+            # Find sender/receiver shard global offsets
+            s_shard = next(s for s in trainer_shards if s.rank == t.sender_rank)
+            r_shard = next(s for s in gen_shards if s.rank == t.receiver_rank)
+
+            # Trainer side: chunk in global coords
+            s_row = s_shard.offset[0] + t.sender_offset[0]
+            s_col = s_shard.offset[1] + t.sender_offset[1]
+            px, py, pw, ph = to_px(left_x, s_row, s_col, t.shape[0], t.shape[1])
+            parts.append(
+                f'<rect x="{px:.1f}" y="{py:.1f}" width="{pw:.1f}" height="{ph:.1f}" '
+                f'fill="{color}" fill-opacity="0.55" stroke="{color}" stroke-width="0.5"/>'
+            )
+
+            # Generator side: chunk in global coords
+            r_row = r_shard.offset[0] + t.receiver_offset[0]
+            r_col = r_shard.offset[1] + t.receiver_offset[1]
+            px, py, pw, ph = to_px(right_x, r_row, r_col, t.shape[0], t.shape[1])
+            parts.append(
+                f'<rect x="{px:.1f}" y="{py:.1f}" width="{pw:.1f}" height="{ph:.1f}" '
+                f'fill="{color}" fill-opacity="0.55" stroke="{color}" stroke-width="0.5"/>'
+            )
+
+        # Draw shard boundary outlines and rank labels on top
+        def draw_shard_outlines(shards, base_x, prefix):
+            for s in shards:
+                x = base_x + (s.offset[1] / cols) * grid_w
+                y = top_y + (s.offset[0] / rows) * grid_h
+                w = (s.local_shape[1] / cols) * grid_w
+                h = (s.local_shape[0] / rows) * grid_h
+                parts.append(
+                    f'<rect x="{x:.1f}" y="{y:.1f}" width="{w:.1f}" height="{h:.1f}" '
+                    f'fill="none" stroke="{shard_border_color}" stroke-width="2"/>'
+                )
+                # Rank label
+                cx, cy = x + w / 2, y + h / 2
+                parts.append(
+                    f'<text x="{cx:.1f}" y="{cy:.1f}" text-anchor="middle" '
+                    f'dominant-baseline="central" font-weight="bold" font-size="13" '
+                    f'fill="#222">{prefix}{s.rank}</text>'
+                )
+
+        draw_shard_outlines(trainer_shards, left_x, "T")
+        draw_shard_outlines(gen_shards, right_x, "G")
+
+        # Outer boxes
+        parts.append(f'<rect x="{left_x}" y="{top_y}" width="{grid_w}" height="{grid_h}" '
+                      f'fill="none" stroke="#222" stroke-width="2.5"/>')
+        parts.append(f'<rect x="{right_x}" y="{top_y}" width="{grid_w}" height="{grid_h}" '
+                      f'fill="none" stroke="#222" stroke-width="2.5"/>')
+
+        # "=" sign between grids to show equivalence
+        mid_x = (left_x + grid_w + right_x) // 2
+        mid_y = top_y + grid_h // 2
+        parts.append(f'<text x="{mid_x}" y="{mid_y}" text-anchor="middle" '
+                      f'dominant-baseline="central" font-size="28" fill="#888">=</text>')
+        parts.append(f'<text x="{mid_x}" y="{mid_y + 22}" text-anchor="middle" '
+                      f'font-size="10" fill="#888">same data</text>')
+
+        # Global shape label
+        parts.append(
+            f'<text x="{svg_w // 2}" y="{svg_h - 8}" text-anchor="middle" '
+            f'font-size="11" fill="#888">Global tensor: {rows} x {cols}</text>'
+        )
+
+        parts.append("</svg>")
+        svg_str = "\n".join(parts)
+
+        # Build transfer matrix HTML table
+        n_trainers = len(trainer_shards)
+        n_gens = len(gen_shards)
+
+        # Build lookup: (sender_rank, receiver_rank) -> (transfer_index, chunk)
+        transfer_lookup = {}
+        for i, t in enumerate(transfer_plan):
+            transfer_lookup[(t.sender_rank, t.receiver_rank)] = (i, t)
+
+        table_parts = [
+            '<table style="border-collapse: collapse; margin-top: 12px; font-family: monospace; font-size: 12px;">',
+            '<tr><th style="border: 1px solid #ccc; padding: 6px 10px; background: #f5f5f5;"></th>',
+        ]
+        for g in range(n_gens):
+            table_parts.append(
+                f'<th style="border: 1px solid #ccc; padding: 6px 10px; background: #f5f5f5;">G{g}</th>'
+            )
+        table_parts.append('</tr>')
+
+        for t_rank in range(n_trainers):
+            table_parts.append(
+                f'<tr><td style="border: 1px solid #ccc; padding: 6px 10px; '
+                f'background: #f5f5f5; font-weight: bold;">T{t_rank}</td>'
+            )
+            for g_rank in range(n_gens):
+                key = (t_rank, g_rank)
+                if key in transfer_lookup:
+                    idx, chunk = transfer_lookup[key]
+                    color = transfer_colors[idx]
+                    table_parts.append(
+                        f'<td style="border: 1px solid #ccc; padding: 6px 10px; '
+                        f'background: {color}; color: white; text-align: center; '
+                        f'font-weight: bold; text-shadow: 0 1px 2px rgba(0,0,0,0.4);">'
+                        f'{chunk.shape[0]}x{chunk.shape[1]}</td>'
+                    )
+                else:
+                    table_parts.append(
+                        '<td style="border: 1px solid #ccc; padding: 6px 10px; '
+                        'text-align: center; color: #ccc;">&mdash;</td>'
+                    )
+            table_parts.append('</tr>')
+
+        table_parts.append('</table>')
+        table_str = "\n".join(table_parts)
+
+        # Combine SVG + table
+        return (
+            f'<div style="display: flex; flex-direction: column; align-items: center;">'
+            f'{svg_str}'
+            f'<div style="margin-top: 4px; font-size: 12px; color: #666;">'
+            f'Matching colors = same data chunk. Matrix shows chunk shapes transferred.</div>'
+            f'{table_str}'
+            f'</div>'
+        )
+    return compute_shard_metadata, compute_transfer_plan, render_resharding_svg
+
+
+@app.cell
+def _(mo):
+    # Interactive controls for re-sharding visualization
+    trainer_gpu_slider = mo.ui.slider(1, 8, value=4, label="Trainer GPUs")
+    gen_gpu_slider = mo.ui.slider(1, 8, value=2, label="Generator GPUs")
+    trainer_dim_dropdown = mo.ui.dropdown(
+        options={"Row (dim 0)": 0, "Col (dim 1)": 1},
+        value="Row (dim 0)",
+        label="Trainer shard dim",
+    )
+    gen_dim_dropdown = mo.ui.dropdown(
+        options={"Row (dim 0)": 0, "Col (dim 1)": 1},
+        value="Col (dim 1)",
+        label="Generator shard dim",
+    )
+
+    mo.hstack(
+        [trainer_gpu_slider, trainer_dim_dropdown, gen_gpu_slider, gen_dim_dropdown],
+        justify="center",
+        gap=1,
+    )
+    return (
+        gen_dim_dropdown,
+        gen_gpu_slider,
+        trainer_dim_dropdown,
+        trainer_gpu_slider,
+    )
+
+
+@app.cell
+def _(
+    compute_shard_metadata,
+    compute_transfer_plan,
+    gen_dim_dropdown,
+    gen_gpu_slider,
+    mo,
+    render_resharding_svg,
+    trainer_dim_dropdown,
+    trainer_gpu_slider,
+):
+    # Compute shards and transfer plan based on widget values
+    _global_shape = (512, 512)
+    _t_shards = compute_shard_metadata(_global_shape, trainer_gpu_slider.value, trainer_dim_dropdown.value)
+    _g_shards = compute_shard_metadata(_global_shape, gen_gpu_slider.value, gen_dim_dropdown.value)
+    _plan = compute_transfer_plan(_t_shards, _g_shards)
+
+    _svg = render_resharding_svg(_t_shards, _g_shards, _plan, _global_shape)
+
+    # Compute stats for the callout
+    _routed_bytes = sum(t.shape[0] * t.shape[1] * 2 for t in _plan)  # bf16 = 2 bytes
+    _gather_bytes = _global_shape[0] * _global_shape[1] * 2 * gen_gpu_slider.value
+    _waste_pct = (1 - _routed_bytes / _gather_bytes) * 100 if _gather_bytes > 0 else 0
+
+    resharding_stats = {
+        "transfers": len(_plan),
+        "routed_bytes": _routed_bytes,
+        "gather_bytes": _gather_bytes,
+        "waste_pct": _waste_pct,
+    }
+
+    _stats_md = mo.md(f"""
+    **Transfer Plan Stats** | **Transfers**: {len(_plan)} chunks | **Routed**: {_routed_bytes / 1024:.1f} KB | **Gather**: {_gather_bytes / 1024:.1f} KB | **Saved**: {_waste_pct:.0f}%
+    """)
+
+    mo.vstack([mo.Html(_svg), mo.callout(_stats_md, kind="info")])
+    return
+
+
+@app.cell
 def _(mo):
     mo.md(r"""
     ## 8. Putting It All Together
@@ -672,7 +1209,7 @@ def _(mo):
 
     ```
     ┌─────────────────────────────────────────────────────────────────┐
-    │                         TRAINER                                  │
+    │                         TRAINER                                 │
     │  1. Train step completes                                        │
     │  2. Copy weights to CPU staging buffer (non-blocking D2H)       │
     │  3. Publish to circular buffer with version tag                 │
@@ -682,7 +1219,7 @@ def _(mo):
                                     ▼
     ┌─────────────────────────────────────────────────────────────────┐
     │              CIRCULAR BUFFER (CPU, RDMA-registered)             │
-    │  [slot 0: v3] [slot 1: v4] [slot 2: v5]                        │
+    │  [slot 0: v3] [slot 1: v4] [slot 2: v5]                         │
     │                                 ↑ latest                        │
     └─────────────────────────────────────────────────────────────────┘
                                     │
@@ -723,6 +1260,12 @@ def _(mo):
     All 5 actors run **concurrently and independently**. The trainer never waits for generators,
     and each generator grabs weights whenever it's ready (at slightly different rates to show
     the async behavior). To verify correctness, we set weights to `version` and check on read.
+
+    **Race condition safety**: The circular buffer's slot count is tuned so that
+    `buffer_size × update_interval >> sync_time`. This ensures a slot isn't overwritten
+    while a generator is reading it. In this demo: 5 slots, ~1s between trainer updates,
+    RDMA sync takes ~ms, so a race is effectively impossible. In production, tune
+    `buffer_size` based on actual sync time and update frequency.
     """)
     return
 
@@ -802,7 +1345,7 @@ def _(
                     if handle is not None and version > self.current_version:
                         handle.read_into(self.weight_bytes).get()
                         actual = int(self.weights[0].item())
-                        if actual >= version:
+                        if actual >= version:  # >= not == : a later version may have written to same slot
                             self.current_version = actual
                             print(f"[Gen {self.gen_id}] Synced to v{actual}")
                             sys.stdout.flush()
