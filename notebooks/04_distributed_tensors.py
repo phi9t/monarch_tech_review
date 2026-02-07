@@ -406,20 +406,6 @@ def _(comms, monarch, nn, torch):
 
 
 
-    def simulate():
-        simulator = monarch.Simulator(hosts=1, gpus=4, trace_mode="stream_only")
-        mesh = simulator.mesh.rename(gpu="dp")
-        with mesh.activate():
-            model = Net()
-
-            train2(model, torch.rand(3, 4), torch.full((3,), 1, dtype=torch.int64))
-
-            try:
-                simulator.display()
-            except Exception:
-                pass
-
-    simulate()
     return
 
 
