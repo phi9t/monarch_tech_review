@@ -41,7 +41,7 @@ def _(mo):
     This notebook is about making that problem disappear — using RDMA to move
     weights from trainer to generators so fast it becomes invisible.
 
-    **Want to go deeper?** Check out **06b_weight_sync_deep_dive.py** for ibverbs internals
+    **Want to go deeper?** Check out **07b_weight_sync_deep_dive.py** for ibverbs internals
     and RDMA buffer patterns. This notebook focuses on
     the concepts and patterns you need to know for async RL.
     """)
@@ -56,7 +56,7 @@ def _(mo):
     This notebook assumes familiarity with:
 
     - **PyTorch basics** - tensors, dtypes, device placement
-    - **On-policy vs off-policy RL** - covered in [NB04: Async RL](./04_async_rl.py)
+    - **On-policy vs off-policy RL** - covered in [NB05: RL Intro](./05_rl_intro.html)
     - **Monarch Actor model** - spawning actors, endpoints, `call_one`/`call` (from [NB01](./01_history_and_vision.py) and [NB02](./02_interactive_devx.py))
     - **Basic networking concepts** - what bandwidth and latency mean, client-server vs peer-to-peer
     """)
@@ -479,7 +479,7 @@ def _(mo):
     involved. In async RL, pull is more natural because each generator decides *when* it
     needs fresh weights.
 
-    **Want to understand how RDMA works under the hood?** Check out **06b_weight_sync_deep_dive.py**
+    **Want to understand how RDMA works under the hood?** Check out **07b_weight_sync_deep_dive.py**
     for ibverbs internals, queue pair setup, and why Monarch's actor model is such a natural fit
     for managing RDMA connections. It's actors all the way down!
     """)
@@ -1475,12 +1475,12 @@ def _(mo):
 
     ### Want More?
 
-    - **06b_weight_sync_deep_dive.py** - ibverbs internals, RDMA buffer patterns
-    - **07_async_rl_e2e.py** - Complete async RL system using these patterns
+    - **07b_weight_sync_deep_dive.py** - ibverbs internals, RDMA buffer patterns
+    - **08_rl_e2e.py** - Complete async RL system using these patterns
 
     ---
 
-    **Previous:** [NB05 — Services](./05_services.html) · **Next:** [NB06b — RDMA Deep Dive](./06b_weight_sync_deep_dive.html)
+    **Previous:** [NB06 — Services](./06_services.html) · **Next:** [NB07b — RDMA Deep Dive](./07b_weight_sync_deep_dive.html)
     """)
     return
 

@@ -11,7 +11,12 @@ This repo contains a series of notebooks that progressively introduce Monarch co
 | `01_history_and_vision.py` | Tensor engine origins, Hyperactor, the actor model |
 | `02_interactive_devx.py` | SPMDJob, HostMesh, remote torchrun experience |
 | `03_fault_tolerance.py` | Error handling, supervision, TorchFT, semi-sync training |
-| `04_async_rl.py` | Services, weight sync, RDMA, full async RL loop |
+| `04_distributed_tensors.py` | Mesh activation, tensor compute, collectives, device mesh dimensions |
+| `05_rl_intro.py` | RL at scale: sync vs async, on-policy vs off-policy, Zorplex benchmark |
+| `06_services.py` | Services: round-robin routing, health tracking, failure recovery |
+| `07_rdma_weight_sync.py` | RDMA weight sync, CPU staging, circular buffers |
+| `07b_weight_sync_deep_dive.py` | ibverbs internals, RDMA buffer patterns |
+| `08_rl_e2e.py` | Full end-to-end async RL loop with weight sync |
 
 ## Prerequisites
 
@@ -55,7 +60,7 @@ This opens the notebook in your browser with live editing:
 uv run marimo edit notebooks/01_history_and_vision.py
 
 # Or run any notebook
-uv run marimo edit notebooks/04_async_rl.py
+uv run marimo edit notebooks/08_rl_e2e.py
 ```
 
 ### Option 2: App mode (read-only)

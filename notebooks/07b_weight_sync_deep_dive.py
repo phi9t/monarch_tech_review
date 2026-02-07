@@ -35,7 +35,7 @@ def _(mo):
     mo.md(r"""
     # RDMA Deep Dive
 
-    Notebook 06 covered weight synchronization end-to-end: why RDMA matters for async RL,
+    Notebook 07 covered weight synchronization end-to-end: why RDMA matters for async RL,
     the magic pointer pattern, circular buffers, and re-sharding. We used `RDMABuffer` and
     `read_into()` as black boxes — call the API, weights appear.
 
@@ -617,7 +617,7 @@ def _(mo):
 
     ---
 
-    **Previous:** [NB06 — RDMA Weight Sync](./06_rdma_weight_sync.html) · **Next:** [NB07 — Async RL E2E](./07_rl_e2e.html)
+    **Previous:** [NB07 — RDMA Weight Sync](./07_rdma_weight_sync.html) · **Next:** [NB08 — Async RL E2E](./08_rl_e2e.html)
     """)
     return
 

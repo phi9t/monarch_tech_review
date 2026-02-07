@@ -416,7 +416,7 @@ def _(mo):
 
     ---
 
-    **Previous:** [NB02 — Interactive DevX](./02_interactive_devx.html) · **Next:** [NB03b — Distributed Tensors](./03b_distributed_tensors.html)
+    **Previous:** [NB02 — Interactive DevX](./02_interactive_devx.html) · **Next:** [NB04 — Distributed Tensors](./04_distributed_tensors.html)
     """)
     return
 

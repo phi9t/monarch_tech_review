@@ -362,7 +362,7 @@ def _(mo):
 
     ---
 
-    **Previous:** [NB03 — Fault Tolerance](./03_fault_tolerance.html) · **Next:** [NB04 — RL Intro](./04_rl_intro.html)
+    **Previous:** [NB03 — Fault Tolerance](./03_fault_tolerance.html) · **Next:** [NB05 — RL Intro](./05_rl_intro.html)
     """)
     return
 

@@ -512,7 +512,7 @@ def _(mo):
 
     ---
 
-    **Previous:** [NB04 — RL Intro](./04_rl_intro.html) · **Next:** [NB06 — RDMA Weight Sync](./06_rdma_weight_sync.html)
+    **Previous:** [NB05 — RL Intro](./05_rl_intro.html) · **Next:** [NB07 — RDMA Weight Sync](./07_rdma_weight_sync.html)
     """)
     return
 

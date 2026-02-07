@@ -482,7 +482,7 @@ def _(mo):
     simple but sparse. In practice, you might add **reward shaping** —
     penalties for excessive tool calls (compositional tasks tend to spam
     LOOKUP), bonuses for correct output formatting. We'll explore shaped
-    rewards in NB07 when we wire up the full RL loop.
+    rewards in NB08 when we wire up the full RL loop.
 
     The standard **synchronous RL loop** looks like this:
 
@@ -752,8 +752,8 @@ def _(mo):
 
     - **Actors with endpoints** for defining remote generators, buffer, and trainer
     - **Fault tolerance** (NB03) for keeping generators alive when GPUs fail
-    - **Services** (NB05) for managing pools of generators with health tracking
-    - **RDMA weight sync** (NB06) for moving hundreds of MB without blocking
+    - **Services** (NB06) for managing pools of generators with health tracking
+    - **RDMA weight sync** (NB07) for moving hundreds of MB without blocking
     """)
     return
 
@@ -967,19 +967,19 @@ def _(mo):
 
     The next three notebooks each tackle one piece:
 
-    - **NB05 — Services**: How do you manage a pool of generator actors?
+    - **NB06 — Services**: How do you manage a pool of generator actors?
       Round-robin routing, health tracking, and discovery — so the trainer
       can find generators without hardcoding addresses.
-    - **NB06 — RDMA Weight Sync**: After each training step, generators
+    - **NB07 — RDMA Weight Sync**: After each training step, generators
       need fresh weights. But how do you move hundreds of MB without blocking
       training? RDMA separates the control plane (tiny handle message) from
       the data plane (bulk transfer).
-    - **NB07 — Async RL E2E**: Wire it all together — generators, buffer,
+    - **NB08 — Async RL E2E**: Wire it all together — generators, buffer,
       trainer, weight sync — into a working async RL loop on Zorplex.
 
     ---
 
-    **Previous:** [NB03b — Distributed Tensors](./03b_distributed_tensors.html) · **Next:** [NB05 — Services](./05_services.html)
+    **Previous:** [NB04 — Distributed Tensors](./04_distributed_tensors.html) · **Next:** [NB06 — Services](./06_services.html)
     """)
     return
 
