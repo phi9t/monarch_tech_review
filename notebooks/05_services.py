@@ -509,6 +509,10 @@ def _(mo):
 
     **Next: RDMA Weight Sync** — using Monarch's RDMA primitives for direct
     GPU-to-GPU weight transfer.
+
+    ---
+
+    **Previous:** [NB04 — RL Intro](./04_rl_intro.html) · **Next:** [NB06 — RDMA Weight Sync](./06_rdma_weight_sync.html)
     """)
     return
 

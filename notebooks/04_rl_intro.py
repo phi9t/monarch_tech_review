@@ -976,6 +976,10 @@ def _(mo):
       the data plane (bulk transfer).
     - **NB07 — Async RL E2E**: Wire it all together — generators, buffer,
       trainer, weight sync — into a working async RL loop on Zorplex.
+
+    ---
+
+    **Previous:** [NB03b — Distributed Tensors](./03b_distributed_tensors.html) · **Next:** [NB05 — Services](./05_services.html)
     """)
     return
 

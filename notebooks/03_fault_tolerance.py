@@ -413,6 +413,10 @@ def _(mo):
 
     We've built patterns to handle failures. Next: putting it all together —
     services, weight sync, and async RL loops.
+
+    ---
+
+    **Previous:** [NB02 — Interactive DevX](./02_interactive_devx.html) · **Next:** [NB03b — Distributed Tensors](./03b_distributed_tensors.html)
     """)
     return
 

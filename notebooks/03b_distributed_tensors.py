@@ -359,6 +359,10 @@ def _(monarch):
 def _(mo):
     mo.md(r"""
     The DDP example again, but using multiple streams:
+
+    ---
+
+    **Previous:** [NB03 — Fault Tolerance](./03_fault_tolerance.html) · **Next:** [NB04 — RL Intro](./04_rl_intro.html)
     """)
     return
 

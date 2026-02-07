@@ -1477,6 +1477,10 @@ def _(mo):
 
     - **06b_weight_sync_deep_dive.py** - ibverbs internals, RDMA buffer patterns
     - **07_async_rl_e2e.py** - Complete async RL system using these patterns
+
+    ---
+
+    **Previous:** [NB05 — Services](./05_services.html) · **Next:** [NB06b — RDMA Deep Dive](./06b_weight_sync_deep_dive.html)
     """)
     return
 

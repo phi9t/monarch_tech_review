@@ -151,7 +151,7 @@ def _(TrainMetrics, Trajectory, mo):
     - `model_only_text` stores the model's generated tokens without injected tool
       results, so the trainer can compute log-probabilities on exactly what the model produced.
     - `has_answer_tag` tracks whether the model emitted `[ANSWER]` -- this is the
-      format compliance signal from NB04's failure mode analysis.
+      format compliance signal from [NB04](./04_rl_intro.html)'s failure mode analysis.
     - `failure_mode` classifies each trajectory as `"success"`, `"wrong_format"`,
       `"tool_spam"`, or `"wrong_answer"` so we can track which failure modes improve
       during training.
@@ -215,7 +215,7 @@ def _(mo):
 
     Tool execution environments (docker containers, sandboxes, API endpoints) naturally
     form a fleet -- you want many instances running in parallel to keep up with
-    generation throughput. That makes them a good fit for a **Service** (from NB05)
+    generation throughput. That makes them a good fit for a **Service** (from [NB05](./05_services.html))
     with health tracking and round-robin routing.
 
     Our ZorplexWorker actors handle Zorplex tasks:
@@ -382,7 +382,7 @@ def _(mo):
     `CUDA_VISIBLE_DEVICES` in `setup()`. Here, the trainer hardcodes GPU 0
     and generators use GPU 1+.
 
-    **Circular buffer with CPU staging** (from NB06): After each training step,
+    **Circular buffer with CPU staging** (from [NB06](./06_rdma_weight_sync.html)): After each training step,
     weights are copied GPU -> CPU into a circular buffer slot. Generators read
     from CPU via RDMA, then copy to their own GPU. This decouples training from
     weight distribution.
@@ -394,7 +394,7 @@ def _(mo):
     Each slot is a single **contiguous** CPU buffer — all parameters packed
     end-to-end. This means one RDMA read transfers the entire model. An
     alternative is keeping parameters scattered and batching reads with
-    `RDMAAction`. We go into the different patterns and trade-offs in NB06b.
+    `RDMAAction`. We go into the different patterns and trade-offs in [NB06b](./06b_weight_sync_deep_dive.html).
     """)
     return
 
@@ -699,7 +699,7 @@ def _(mo):
     `input_ids` and `prompt_length` for the trainer.
 
     **Reward shaping.** Instead of a binary 0/1 reward, we decompose rewards from
-    the failure modes identified in NB04:
+    the failure modes identified in [NB04](./04_rl_intro.html):
 
     | Component | Value | Why |
     |-----------|-------|-----|
@@ -712,7 +712,7 @@ def _(mo):
     gradient signal is richer than binary: the model gets *partial credit* for
     good formatting even before it learns the right answers.
 
-    Weight sync uses the pattern from NB06: the trainer publishes weights to CPU
+    Weight sync uses the pattern from [NB06](./06_rdma_weight_sync.html): the trainer publishes weights to CPU
     slots (circular buffer), and generators pull via RDMA into a CPU staging
     buffer, then scatter into GPU parameters (H2D copy). Ideally we'd load
     directly from the trainer's CPU buffer into the model's `state_dict` to
@@ -940,7 +940,7 @@ def _(mo):
     ## Architecture Overview
 
     Now we have all our actors defined. Here's how they connect -- this is the
-    **single-controller paradigm** from NB01: the notebook process orchestrates
+    **single-controller paradigm** from [NB01](./01_history_and_vision.html): the notebook process orchestrates
     everything, but actors do the heavy lifting on their own GPUs.
 
     ```
@@ -974,7 +974,7 @@ def _(mo):
     them directly via `.call()` (broadcast to all) or `.slice()` (individual
     access). This is natural for sync RL (broadcast generate, then train) and
     for async RL (each thread slices its own generator). ZorplexWorkers are
-    wrapped in a **Service** (NB05 pattern) because they're stateless: any
+    wrapped in a **Service** ([NB05](./05_services.html) pattern) because they're stateless: any
     worker can handle any request, so round-robin routing and health tracking
     are useful. In production async RL, you might wrap generators in a Service
     too -- that gives you auto-scaling and health tracking -- but here the
@@ -1090,7 +1090,7 @@ def _(mo):
     This is the **single-controller paradigm** in action. The notebook process
     orchestrates a careful initialization sequence:
 
-    1. Spawn ZorplexWorkers via a **Service** (NB05 pattern -- health tracking, round-robin)
+    1. Spawn ZorplexWorkers via a **Service** ([NB05](./05_services.html) pattern -- health tracking, round-robin)
     2. Spawn GeneratorWorkers as a plain **ActorMesh** and call `setup()` on all via
        `.call()` broadcast (loads model onto each GPU)
     3. Spawn ReplayBuffer (CPU-only, ready immediately)
@@ -1180,7 +1180,14 @@ def _(
         print("[TEARDOWN] All actors stopped.")
 
     actors = setup_actors()
-    return BATCH_SIZE, NUM_GENERATORS, NUM_STEPS, actors, setup_actors, teardown_actors
+    return (
+        BATCH_SIZE,
+        NUM_GENERATORS,
+        NUM_STEPS,
+        actors,
+        setup_actors,
+        teardown_actors,
+    )
 
 
 @app.cell
@@ -1203,7 +1210,7 @@ def _(actors, mo):
     mo.md(f"""
     ### Pre-Training Results
 
-    **Metrics refresher** (from NB04): *Accuracy* is how often the model gets the
+    **Metrics refresher** (from [NB04](./04_rl_intro.html)): *Accuracy* is how often the model gets the
     correct answer. *Format compliance* tracks whether it emits the `[ANSWER]` tag
     we trained it to use. *Avg turns/tool calls* measure how many interaction
     steps the model takes — lower is more efficient.
@@ -1271,13 +1278,7 @@ def _(actors, mo):
 
 
 @app.cell
-def _(
-    NUM_GENERATORS,
-    NUM_STEPS,
-    TimingEvent,
-    TimingStats,
-    time,
-):
+def _(NUM_GENERATORS, NUM_STEPS, TimingEvent, TimingStats, time):
     def run_sync_loop(actors) -> TimingStats:
         """
         SYNC MODE: Broadcast generate to all generators, then train.
@@ -1525,7 +1526,7 @@ def _(actors, run_sync_loop):
     print("Evaluating post-sync performance...")
     sync_post_eval = actors["trainer"].evaluate_zorplex.call_one(num_samples=10, seed=42).get()
     print(f"Post-sync accuracy: {sync_post_eval['accuracy']:.0%}")
-    return (sync_post_eval, sync_stats)
+    return sync_post_eval, sync_stats
 
 
 @app.cell
@@ -1559,7 +1560,7 @@ def _(actors, run_async_loop, setup_actors, teardown_actors):
     print("Evaluating post-async performance...")
     async_post_eval = async_actors["trainer"].evaluate_zorplex.call_one(num_samples=10, seed=42).get()
     print(f"Post-async accuracy: {async_post_eval['accuracy']:.0%}")
-    return (async_post_eval, async_stats)
+    return async_post_eval, async_stats
 
 
 @app.cell
@@ -1794,7 +1795,7 @@ def _(mo):
     set in `setup()`, not at spawn time -- the `procs` dimension in `spawn_procs`
     is just a dimension name, not a GPU assignment.
 
-    **Weight sync data flow** (circular buffer + CPU staging from NB06):
+    **Weight sync data flow** (circular buffer + CPU staging from [NB06](./06_rdma_weight_sync.html)):
     ```
     Trainer GPU  --D2H-->  CPU slot[v % 3]  --RDMA-->  Generator CPU staging  --H2D-->  Generator GPU
     ```
@@ -1821,7 +1822,7 @@ def _(mo):
     - Async mode uses `.slice()` per thread so each generator runs independently --
       no generator waits for another
 
-    **Fault tolerance** (from NB03):
+    **Fault tolerance** (from [NB03](./03_fault_tolerance.html)):
     - Generation loops wrap `generate_trajectory.call_one().get()` in `try/except`
     - On failure, the generator logs and retries instead of crashing the loop
     """)
@@ -1850,8 +1851,7 @@ def _(mo):
     - RDMA + circular buffer for efficient weight transfer
     - Version tracking for consistency across actors
 
-    This is the foundation for production systems like Forge GRPO, which uses the
-    same Monarch actor patterns at much larger scale.
+    This is the foundation for which you could build production systems, using monarch at scale.
     """)
     return
 
@@ -1879,7 +1879,7 @@ def _(mo):
       and slicing compose naturally into a full training system
     - Async RL collects more data per unit wall time by running generators
       and trainer concurrently
-    - The circular buffer + CPU staging pattern from NB06 decouples training
+    - The circular buffer + CPU staging pattern from [NB06](./06_rdma_weight_sync.html) decouples training
       from weight distribution
     - Before/after evaluation closes the loop: we can measure whether training
       actually improves the model
@@ -1888,7 +1888,16 @@ def _(mo):
     scale -- multiple nodes, larger models, PPO/GRPO instead of REINFORCE, and
     proper reward modeling. The Monarch primitives you've learned here are the
     building blocks for all of it.
+
+    ---
+
+    **Previous:** [NB06b — RDMA Deep Dive](./06b_weight_sync_deep_dive.html)
     """)
+    return
+
+
+@app.cell
+def _():
     return
 
 

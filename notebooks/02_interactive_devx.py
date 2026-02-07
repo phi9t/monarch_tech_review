@@ -314,6 +314,10 @@ def _(mo):
     # Edit train.py, then re-run without reprovisioning:
     job.run_spmd()
     ```
+
+    ---
+
+    **Previous:** [NB01 — History & Vision](./01_history_and_vision.html) · **Next:** [NB03 — Fault Tolerance](./03_fault_tolerance.html)
     """)
     return
 

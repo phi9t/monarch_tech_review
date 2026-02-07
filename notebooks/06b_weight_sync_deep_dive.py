@@ -614,6 +614,10 @@ def _(mo):
     magic pointers, CPU staging, circular buffers, and DTensor re-sharding. This notebook
     showed the RDMA specifics underneath: what the NIC is actually doing and how to avoid
     paying unnecessary costs on the hot path.
+
+    ---
+
+    **Previous:** [NB06 — RDMA Weight Sync](./06_rdma_weight_sync.html) · **Next:** [NB07 — Async RL E2E](./07_rl_e2e.html)
     """)
     return
 

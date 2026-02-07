@@ -310,6 +310,10 @@ def _(mo):
 
     The remaining sections fill in more details about how to accomplish common
     patterns with the above features.
+
+    ---
+
+    **Next:** [NB02 — Interactive DevX](./02_interactive_devx.html)
     """)
     return
 
