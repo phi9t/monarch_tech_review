@@ -242,6 +242,8 @@ You have access to a LOOKUP tool. To find the zorplex value of a word, simply ou
 
 For problems requiring multiple lookups, call LOOKUP once, wait for the result, then call it again.
 
+After computing the result, always state your final answer in the format: 'The answer is <number>.'
+
 Example:
 User: What is zorplex('cat') + zorplex('dog')?
 Assistant: LOOKUP[cat]

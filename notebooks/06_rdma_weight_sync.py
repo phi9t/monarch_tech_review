@@ -41,8 +41,8 @@ def _(mo):
     This notebook is about making that problem disappear — using RDMA to move
     weights from trainer to generators so fast it becomes invisible.
 
-    **Want to go deeper?** Check out **06b_weight_sync_deep_dive.py** for ibverbs internals,
-    memory registration benchmarks, and full implementations. This notebook focuses on
+    **Want to go deeper?** Check out **06b_weight_sync_deep_dive.py** for ibverbs internals
+    and RDMA buffer patterns. This notebook focuses on
     the concepts and patterns you need to know for async RL.
     """)
     return
@@ -682,9 +682,6 @@ def _(mo):
     No allocation, no registration on the critical path. Tune `n_slots` so that the trainer
     can't lap the slowest generator — if it does, the generator reads a corrupted mix of
     two versions (not a graceful error, just silent data corruption).
-
-    **Want to see a full implementation?** Check out **06b_weight_sync_deep_dive.py** for a
-    complete `CircularWeightBuffer` class with versioning and RDMA integration.
     """)
     return
 
@@ -846,9 +843,6 @@ def _(mo):
 
     The routed approach batches all needed transfers into one plan.
     Pre-compute the plan once at handshake, execute it on each sync.
-
-    **Want to see the overlap computation and benchmarks?** Check out **06b_weight_sync_deep_dive.py**
-    for the full DTensor re-sharding implementation with placement-aware routing.
     """)
     return
 
@@ -1481,7 +1475,7 @@ def _(mo):
 
     ### Want More?
 
-    - **06b_weight_sync_deep_dive.py** - ibverbs internals, benchmarks, full implementations
+    - **06b_weight_sync_deep_dive.py** - ibverbs internals, RDMA buffer patterns
     - **07_async_rl_e2e.py** - Complete async RL system using these patterns
     """)
     return

@@ -6,7 +6,7 @@ Provides common dataclasses used across RL training:
 - TrainMetrics: Metrics from a training step
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass
@@ -22,6 +22,10 @@ class Trajectory:
     generator_id: int
     policy_version: int  # Which version of weights was used
     model_only_text: str = ""  # Model-generated text only (no tool results)
+    # Pre-tokenized sequence and prompt boundary for training.
+    # The generator populates these so the trainer never needs to re-tokenize.
+    input_ids: list[int] = field(default_factory=list)
+    prompt_length: int = 0  # Number of prompt tokens (response starts here)
 
 
 @dataclass

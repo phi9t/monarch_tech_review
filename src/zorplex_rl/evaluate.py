@@ -71,6 +71,8 @@ def generate_with_tools(
     device: str,
     max_turns: int = 5,
     max_tokens_per_turn: int = 150,
+    temperature: float = 0.7,
+    do_sample: bool = True,
 ) -> AgenticResult:
     """Generate with iterative tool execution.
 
@@ -108,15 +110,17 @@ def generate_with_tools(
 
         # Generate until tool call or max tokens
         with torch.no_grad():
-            outputs = model.generate(
+            gen_kwargs = dict(
                 **inputs,
                 max_new_tokens=max_tokens_per_turn,
-                temperature=0.7,
-                do_sample=True,
                 pad_token_id=tokenizer.eos_token_id,
                 eos_token_id=tokenizer.eos_token_id,
                 stopping_criteria=stop_criteria,
+                do_sample=do_sample,
             )
+            if do_sample:
+                gen_kwargs["temperature"] = temperature
+            outputs = model.generate(**gen_kwargs)
 
         # Decode only the new tokens
         new_text = tokenizer.decode(
