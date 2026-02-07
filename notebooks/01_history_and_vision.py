@@ -1,12 +1,13 @@
 import marimo
 
-__generated_with = "0.19.7"
+__generated_with = "0.19.9"
 app = marimo.App(width="medium")
 
 
 @app.cell
 def _():
     import marimo as mo
+
     return (mo,)
 
 
@@ -61,7 +62,7 @@ def _(mo):
     3. The actor model and why it matters for distributed ML
     4. Your first Monarch program: ping-pong actors
     5. The Monarch ontology: World, Proc, Actor, Port
-    6. How Monarch scales
+    6. Scalable messaging via meshes
     """)
     return
 
@@ -220,39 +221,20 @@ def _():
 @app.cell
 def _(mo):
     mo.md(r"""
-    ## The Monarch Ontology
+    ## Scalable Messaging
 
-    Now that you've run code, let's name the pieces. Monarch has a strict
-    hierarchy:
+    Meshes of actors enable **scalable** messaging through tree-based routing.
 
-    ```
-    WORLD (gang-scheduled group of processes)
-    ├── PROC 0 (single actor runtime instance)
-    │   └── Actor "players" (pid=0, a.k.a. "Ping")
-    │       └── Port 0 (ping endpoint)
-    └── PROC 1
-        └── Actor "players" (pid=1, a.k.a. "Pong")
-            └── Port 0 (ping endpoint)
-    ```
+    Instead of sending messages individually to every actor, Monarch routes through a
+    **tree of intermediate hosts**, giving **O(log N) broadcast**. The same tree
+    aggregates responses on the way back up, giving **O(log N) reduce** as well.
 
-    In Monarch, a **mesh** is a named, multi-dimensional collection of identical
-    resources that you can address and operate on as a group. A HostMesh contains
-    hosts, a ProcMesh contains processes, an ActorMesh contains actor instances —
-    each layer spawns the next.
+    This means primitives like barriers and all-reduces are as simple as
+    waiting for an aggregate response — and they scale to thousands of actors
+    without bottlenecking the client.
 
-    **Definitions:**
-
-    - **World**: A fixed group of processes launched together via gang scheduling
-      (all processes start together as a group — if any fails to start, none do)
-    - **Proc**: A single actor runtime instance. One proc runs on one GPU (or CPU).
-    - **Actor**: An independent async unit with its own mailbox. Communicates only
-      through messages — never shares memory.
-    - **Port**: A typed message endpoint. Each `@endpoint` decorator creates a port.
-
-    In the ping-pong example above:
-    - The **World** is the group of 2 procs we spawned
-    - Each **Proc** hosts one PingPong **Actor**
-    - The `ping` method is a **Port**
+    *(See the animated diagrams in the
+    [Monarch presentation notebook](https://github.com/meta-pytorch/monarch/blob/main/examples/presentation/presentation.ipynb))*
     """)
     return
 
@@ -260,37 +242,53 @@ def _(mo):
 @app.cell
 def _(mo):
     mo.md(r"""
-    ## Why It Scales
+    ## Channels and Low-level Messaging
 
-    Monarch is designed to run millions of actors. Most actor systems use a
-    global routing table — Monarch doesn't. Instead, every entity has a
-    hierarchical ID that **encodes the routing path directly**:
+    It is sometimes useful to establish direct channels between two points, or forward
+    the handling of some messages from one actor to another. To enable this, all messaging
+    in Monarch is built out of `Port` objects.
 
-    ```
-    ActorId = (ProcId, actor_name, pid)
-    ProcId  = Ranked(WorldId, rank)
-    ```
+    An actor can create a new `Channel`, which provides a `Port` for sending and a
+    `PortReceiver` for receiving messages. The `Port` object can then be sent to any endpoint.
 
-    A HostMesh contains hosts, each host runs procs (a ProcMesh), and each proc
-    hosts actors (an ActorMesh). The ActorId tells you exactly where to route
-    without any lookup:
+    ```python
+    from monarch.actor import Channel, Port
 
-    ```
-    Example: my_job[5].worker[3]
+    port, recv = Channel.open()
 
-      rank 5 -> host 2 (if 2 procs per host) -> dial addr2:port
-      Then local delivery to worker[3]'s mailbox: O(1)
+    port.send(3)
+    print(recv.recv().get())
     ```
 
-    **Why this beats a global table:**
+    Ports can be passed as arguments to actors and sent a response remotely. We can also
+    directly ask an endpoint to send its response to a port using the `send` messaging primitive.
 
-    | Operation | Global Table | Monarch Hierarchical |
-    |-----------|--------------|---------------------|
-    | Spawn | O(consensus) | O(1) local |
-    | Route (local) | O(cache miss) | O(1) hash |
-    | Route (cross-host) | O(cache miss) | O(log procs) + O(1) local |
-    | Failure | Global invalidation | Local supervision |
-    | Memory | O(actors) per node | O(procs) per node |
+    ```python
+    from monarch.actor import send
+
+    with trainer_procs.activate():
+        send(check_memory, args=(), kwargs={}, port=port)
+    ```
+
+    The port will receive a response from each actor sent the message:
+
+    ```python
+    for _ in range(4):
+        print(recv.recv().get())
+    ```
+
+    The other adverbs like `call`, `stream`, and `broadcast` are just implemented in terms
+    of ports and `send`.
+
+    ### Message Ordering
+
+    Messages from an actor are delivered to the destination actor in the order in which they
+    are sent. If actor A sends message M0 to actor B, then later sends M1 to B, actor B will
+    receive M0 before M1. Messages sent to a mesh of actors behave as if sent individually
+    to each destination.
+
+    Each actor handles its messages **sequentially** — it must finish handling a message before
+    the next one is delivered. Different actors in the same process handle messages **concurrently**.
     """)
     return
 
@@ -300,20 +298,18 @@ def _(mo):
     mo.md(r"""
     ## Summary
 
-    **Key takeaways:**
+    Monarch uniquely provides:
 
-    1. **Born from pain**: Monarch was built for the reality of frontier training —
-       hundreds of failures across thousands of GPUs
-    2. **Single controller**: One Python script orchestrates distributed compute
-    3. **Actors, not threads**: Independent workers communicating via messages,
-       never sharing memory
-    4. **Hierarchical addressing**: O(1) local routing, no global registry, scales
-       to millions of actors
-    5. **Rust + Tokio**: Performance without GC pauses
+    1. Scalable messaging using multidimensional meshes of actors
+    2. Fault tolerance through supervision trees and `__supervise__`
+    3. Point-to-point low-level RDMA
+    4. Built-in distributed tensors
 
-    You've seen how Monarch's actors work. But right now, developing distributed
-    systems means SSH, submit, wait, check logs, repeat. What if you could iterate
-    as fast as local development? That's what we'll build next.
+    This foundation enables building sophisticated multi-machine training programs
+    with clear semantics for distribution, fault tolerance, and communication patterns.
+
+    The remaining sections fill in more details about how to accomplish common
+    patterns with the above features.
     """)
     return
 
