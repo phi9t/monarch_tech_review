@@ -127,7 +127,7 @@ cat > "$OUTPUT_DIR/index.html" << 'INDEXEOF'
   <div class="intro">
     <p>
       These are interactive <a href="https://marimo.io">marimo</a> notebooks
-      from a <a href="https://gpu-mode.com">GPU Mode</a> presentation on
+      that accompany a GPU Mode presentation on February 7th, 2026 about 
       <a href="https://github.com/pytorch/monarch">Monarch</a> &mdash; PyTorch's
       framework for distributed actors, fault tolerance, and async RL.
     </p>
