@@ -3,6 +3,7 @@ set -euo pipefail
 
 PROJECT_ID="monarch-gpu-mode"
 ENTRYPOINT="default"
+IMAGE="${SYGALDRY_IMAGE:-sygaldry/zephyr:spack}"
 REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 LAUNCHER="/mnt/data_infra/workspace/sygaldry/container/launch_container.sh"
 
@@ -11,11 +12,12 @@ usage() {
 Launch an interactive shell in Zephyr container infra.
 
 Usage:
-  scripts/zephyr_shell.sh [--project-id ID] [--entrypoint NAME] [--repo-root PATH] [-- CMD...]
+  scripts/zephyr_shell.sh [--project-id ID] [--entrypoint NAME] [--image IMAGE] [--repo-root PATH] [-- CMD...]
 
 Examples:
   scripts/zephyr_shell.sh
   scripts/zephyr_shell.sh --project-id monarch-gpu-mode
+  scripts/zephyr_shell.sh --image sygaldry/zephyr:base
   scripts/zephyr_shell.sh -- bash -lc "cd /workspace/monarch-gpu-mode && ./scripts/zephyr_uv_run.sh pytest -q"
 USAGE
 }
@@ -27,6 +29,8 @@ while [[ $# -gt 0 ]]; do
       PROJECT_ID="$2"; shift 2 ;;
     --entrypoint)
       ENTRYPOINT="$2"; shift 2 ;;
+    --image)
+      IMAGE="$2"; shift 2 ;;
     --repo-root)
       REPO_ROOT="$2"; shift 2 ;;
     -h|--help)
@@ -65,4 +69,5 @@ exec env \
   SYGALDRY_REPO="$REPO_ROOT" \
   SYGALDRY_BUILD_IMAGE=never \
   SYGALDRY_ENTRYPOINT="$ENTRYPOINT" \
+  SYGALDRY_IMAGE="$IMAGE" \
   "$LAUNCHER" "${PASSTHROUGH[@]}"

@@ -53,6 +53,9 @@ uv sync
 
 On Zephyr infra, use the wrappers below to enforce `.venv` on Spack Python with system site-packages and avoid installing upstream Torch wheels:
 
+- `./scripts/zephyr_shell.sh` defaults to snapshot image `sygaldry/zephyr:spack`.
+- Override image when needed, e.g. `./scripts/zephyr_shell.sh --image sygaldry/zephyr:base`.
+
 ```bash
 ./scripts/zephyr_uv_sync.sh
 ./scripts/zephyr_uv_run.sh marimo edit notebooks/01_history_and_vision.py

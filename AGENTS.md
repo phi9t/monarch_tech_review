@@ -11,7 +11,8 @@
 
 ## Zephyr Container Infra Workflow
 - Execute repository commands through Zephyr container infra, not directly on the host.
-- Open an interactive container shell with `./scripts/zephyr_shell.sh`.
+- Open an interactive container shell with `./scripts/zephyr_shell.sh` (defaults to snapshot image `sygaldry/zephyr:spack`).
+- Override image if needed with `./scripts/zephyr_shell.sh --image sygaldry/zephyr:base`.
 - Initialize/update the project venv with `./scripts/zephyr_uv_sync.sh`.
 - Run all repo commands through `./scripts/zephyr_uv_run.sh ...` (example: `./scripts/zephyr_uv_run.sh pytest`).
 - Use `.codex/skills/zephyr-launch-validate/scripts/launch_and_validate.sh` to launch notebooks with validation in one step.

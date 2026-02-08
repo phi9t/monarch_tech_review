@@ -1,0 +1,2209 @@
+
+ ▐▛███▜▌   Claude Code v2.1.37
+▝▜█████▛▘  Opus 4.6 · Claude Pro
+  ▘▘ ▝▝    /mnt/data_infra/workspace/monarch-gpu-mode
+
+╭──────────────────────────────────────────────────────────────────────────────╮
+│ Plan to implement                                                            │
+│                                                                              │
+│ Plan: Monarch vs Ray — Comprehensive Technical Comparison Document           │
+│                                                                              │
+│ Context                                                                      │
+│                                                                              │
+│ The user wants a detailed technical comparison between PyTorch Monarch and   │
+│ Ray, covering actors, control plane messaging, supervision, and data plane   │
+│ (RDMA). The document should:                                                 │
+│                                                                              │
+│ - Use the marimo notebooks in notebooks/ as a pedagogical guide for          │
+│ explaining each concept                                                      │
+│ - Show side-by-side code examples for both Monarch and Ray for every concept │
+│ - Include GitHub URL links to the actual implementations in both projects    │
+│ - Cover robust distributed programming patterns for large-scale ML/AI        │
+│ training                                                                     │
+│                                                                              │
+│ Output                                                                       │
+│                                                                              │
+│ Single file: docs/monarch-vs-ray-analysis.md (overwrite the existing shorter │
+│  version)                                                                    │
+│                                                                              │
+│ GitHub URL Bases (pinned to current HEAD)                                    │
+│                                                                              │
+│ - Monarch: https://github.com/pytorch/monarch/blob/febefda69e1f9e9a696596b3d │
+│ e368ac557320b21/                                                             │
+│ - Ray: https://github.com/ray-project/ray/blob/25da7108abbec7606e8e0ce057e3a │
+│ 5d22421850f/                                                                 │
+│                                                                              │
+│ Document Structure                                                           │
+│                                                                              │
+│ The document will have 8 sections, each covering one concept with Monarch    │
+│ and Ray side by side. Every section follows the pattern:                     │
+│                                                                              │
+│ 1. Concept explanation (referencing notebooks for Monarch context)           │
+│ 2. Monarch implementation with code example + source links                   │
+│ 3. Ray implementation with code example + source links                       │
+│ 4. Comparison table                                                          │
+│                                                                              │
+│ Section 1: Actor Abstraction                                                 │
+│                                                                              │
+│ Monarch sources:                                                             │
+│ - python/monarch/_src/actor/actor_mesh.py:1569 — class Actor(MeshTrait)      │
+│ - python/monarch/_src/actor/actor_mesh.py:1606 — class ActorMesh(Generic[T]) │
+│ - python/monarch/_src/actor/endpoint.py:509 — @endpoint decorator            │
+│ - Notebook ref: notebooks/01_history_and_vision.py (PingPong example)        │
+│                                                                              │
+│ Ray sources:                                                                 │
+│ - python/ray/actor.py:1201 — class ActorClass(Generic[T])                    │
+│ - python/ray/actor.py:1356 — ActorClass.remote()                             │
+│ - python/ray/actor.py:1886 — class ActorHandle(Generic[T])                   │
+│ - python/ray/actor.py:1511 — ActorClass._remote() (full creation path)       │
+│                                                                              │
+│ Section 2: Topology — Meshes vs Flat Handles                                 │
+│                                                                              │
+│ Monarch sources:                                                             │
+│ - python/monarch/_src/actor/proc_mesh.py:234 — class ProcMesh                │
+│ - python/monarch/_src/actor/host_mesh.py:145 — HostMesh.spawn_procs()        │
+│ - python/monarch/_src/actor/host_mesh.py:48 — this_host()                    │
+│ - hyperactor_mesh/src/proc_mesh.rs — Rust ProcMesh                           │
+│ - hyperactor_mesh/src/actor_mesh.rs — Rust ActorMesh                         │
+│ - hyperactor_mesh/src/comm/multicast.rs — tree-based broadcast               │
+│ - Notebook ref: notebooks/04_distributed_tensors.py (mesh reshape, slicing)  │
+│                                                                              │
+│ Ray sources:                                                                 │
+│ - python/ray/util/placement_group.py:42 — class PlacementGroup               │
+│ - python/ray/util/placement_group.py:146 — placement_group() function        │
+│ - src/ray/raylet/placement_group_resource_manager.h:49 — C++ resource        │
+│ manager                                                                      │
+│                                                                              │
+│ Section 3: Control Plane Messaging                                           │
+│                                                                              │
+│ Monarch sources:                                                             │
+│ - python/monarch/_src/actor/endpoint.py:241 — call_one()                     │
+│ - python/monarch/_src/actor/endpoint.py:268 — call() (broadcast)             │
+│ - python/monarch/_src/actor/endpoint.py:305 — stream()                       │
+│ - python/monarch/_src/actor/endpoint.py:343 — broadcast() (fire-and-forget)  │
+│ - python/monarch/_rust_bindings/monarch_hyperactor/mailbox.pyi — Port,       │
+│ PortReceiver, Mailbox                                                        │
+│ - hyperactor/src/mailbox.rs — Rust mailbox (3977 lines)                      │
+│ - Notebook ref: notebooks/01_history_and_vision.py (Channels, Ports, message │
+│  ordering)                                                                   │
+│                                                                              │
+│ Ray sources:                                                                 │
+│ - python/ray/actor.py:802 — ActorMethod._remote()                            │
+│ - python/ray/includes/object_ref.pxi:37 — ObjectRef (Cython)                 │
+│ - python/ray/_private/worker.py:2858 — ray.get()                             │
+│ - python/ray/_private/worker.py:3074 — ray.wait()                            │
+│ - src/ray/core_worker/core_worker.h:167 — C++ CoreWorker                     │
+│ - src/ray/gcs/gcs_server.h:98 — GCS server                                   │
+│ - src/ray/raylet/node_manager.h:70 — Raylet NodeManager                      │
+│ - src/ray/core_worker/actor_handle.h:34 — C++ ActorHandle (ownership)        │
+│                                                                              │
+│ Section 4: Message Ordering Guarantees                                       │
+│                                                                              │
+│ Monarch sources:                                                             │
+│ - hyperactor/src/ordering.rs:25-50 — BufferState, OrderedSender (per-client  │
+│ sequence numbers)                                                            │
+│ - Notebook ref: notebooks/01_history_and_vision.py (message ordering         │
+│ section)                                                                     │
+│                                                                              │
+│ Ray sources:                                                                 │
+│ - src/ray/core_worker/actor_handle.h:51 — allow_out_of_order_execution flag  │
+│ - python/ray/actor.py:1937 — _ray_allow_out_of_order_execution on            │
+│ ActorHandle                                                                  │
+│                                                                              │
+│ Section 5: Supervision and Fault Tolerance                                   │
+│                                                                              │
+│ Monarch sources:                                                             │
+│ - python/monarch/_src/actor/supervision.py:17 — unhandled_fault_hook()       │
+│ - python/monarch/_rust_bindings/monarch_hyperactor/supervision.pyi —         │
+│ MeshFailure                                                                  │
+│ - Notebook ref: notebooks/03_fault_tolerance.py (supervision trees,          │
+│ __supervise__, TorchFT)                                                      │
+│                                                                              │
+│ Ray sources:                                                                 │
+│ - python/ray/actor.py:1394-1412 — max_restarts, max_task_retries options     │
+│ - python/ray/exceptions.py:332 — RayActorError                               │
+│ - python/ray/exceptions.py:371 — ActorDiedError                              │
+│ - src/ray/gcs/gcs_actor_manager.h:93 — GCS actor lifecycle management        │
+│ - src/ray/gcs/gcs_actor_manager.cc — restart logic (2032 lines)              │
+│                                                                              │
+│ Section 6: Data Plane — RDMA vs Object Store                                 │
+│                                                                              │
+│ Monarch sources:                                                             │
+│ - python/monarch/_src/rdma/rdma.py:210 — class RDMABuffer                    │
+│ - python/monarch/_src/rdma/rdma.py:263 — RDMABuffer.read_into()              │
+│ - python/monarch/_src/rdma/rdma.py:122 — class RdmaController(Actor)         │
+│ - monarch_rdma/src/rdma_manager_actor.rs — Rust RDMA manager                 │
+│ - monarch_rdma/src/rdma_components.rs — RdmaBuffer, QueuePair                │
+│ - monarch_rdma/src/ibverbs_primitives.rs — InfiniBand verbs                  │
+│ - Notebook refs: notebooks/07_rdma_weight_sync.py,                           │
+│ notebooks/07b_weight_sync_deep_dive.py                                       │
+│                                                                              │
+│ Ray sources:                                                                 │
+│ - python/ray/util/collective/collective.py:71 — GroupManager (NCCL/Gloo)     │
+│ - python/ray/util/collective/collective_group/nccl_collective_group.py —     │
+│ NCCL backend                                                                 │
+│ - python/ray/actor.py:1921 — tensor transport per-method config              │
+│ - src/ray/core_worker/core_worker.h — object transfer                        │
+│                                                                              │
+│ Section 7: Distributed Tensors and Training                                  │
+│                                                                              │
+│ Monarch sources:                                                             │
+│ - python/monarch/common/tensor.py:78 — class Tensor (distributed tensor)     │
+│ - python/monarch/common/device_mesh.py:154 — class DeviceMesh                │
+│ - python/monarch/common/device_mesh.py:310 — DeviceMesh.activate()           │
+│ - python/monarch/common/tensor.py:792 — reduce()                             │
+│ - python/monarch/fetch.py:50 — inspect()                                     │
+│ - monarch_tensor_worker/src/comm.rs — NCCL collective comms                  │
+│ - Notebook ref: notebooks/04_distributed_tensors.py                          │
+│                                                                              │
+│ Ray sources:                                                                 │
+│ - python/ray/train/torch/torch_trainer.py:11 — TorchTrainer                  │
+│ - python/ray/train/trainer.py:36 — TrainingIterator                          │
+│                                                                              │
+│ Section 8: Interactive DevX (Single Controller)                              │
+│                                                                              │
+│ Monarch sources:                                                             │
+│ - python/monarch/_src/spmd/actor.py:29 — class SPMDActor(Actor)              │
+│ - python/monarch/_src/job/spmd.py:149 — serve() function                     │
+│ - Notebook ref: notebooks/02_interactive_devx.py                             │
+│                                                                              │
+│ Ray sources:                                                                 │
+│ - Ray Serve / Ray Jobs equivalents (no direct analog to single-controller    │
+│ paradigm)                                                                    │
+│                                                                              │
+│ Closing: Design Philosophy Summary                                           │
+│                                                                              │
+│ Synthesize the core tension: structured topology-aware primitives (Monarch)  │
+│ vs general-purpose simplicity (Ray).                                         │
+│                                                                              │
+│ Shared Rich-Live TUI Library: src/demo_tui/                                  │
+│                                                                              │
+│ Extract reusable components from                                             │
+│ scripts/demo_monarch_two_gpu_transformer_train.py (Dashboard class, lines    │
+│ 71–314) into a shared library.                                               │
+│                                                                              │
+│ src/demo_tui/__init__.py                                                     │
+│                                                                              │
+│ Re-export all public components.                                             │
+│                                                                              │
+│ src/demo_tui/dashboard.py                                                    │
+│                                                                              │
+│ Core multi-pane dashboard framework:                                         │
+│                                                                              │
+│ - class PanelConfig — dataclass: title: str, border_style: str, max_lines:   │
+│ int                                                                          │
+│ - class DashboardBase — base class providing:                                │
+│   - console: Console, start_time: float                                      │
+│   - add_panel(name, config) — register a named panel                         │
+│   - log(message) — append timestamped message to log panel (deque-backed)    │
+│   - set_status(panel_name, key, value) — update key-value data for a panel   │
+│   - render() -> Layout — build Layout from all registered panels             │
+│   - run(callback, refresh_hz=4.0) — enter Rich.Live context, call            │
+│ callback(dashboard) inside it                                                │
+│ - class KeyValuePanel — renders dict of stats as aligned key-value lines     │
+│ - class LogPanel — renders a scrolling log tail (wraps deque)                │
+│ - class ProgressPanel — renders progress bar + spinner + ETA                 │
+│ - class ComparisonPanel — side-by-side Monarch vs Ray output (used by demos) │
+│                                                                              │
+│ src/demo_tui/gpu_monitor.py                                                  │
+│                                                                              │
+│ GPU stats sampling (extracted from Dashboard.sample_gpu_stats, lines         │
+│ 206–246):                                                                    │
+│ - class GpuMonitor — sample() -> list[GpuStats], falls back to               │
+│ torch.cuda.mem_get_info                                                      │
+│                                                                              │
+│ src/demo_tui/spinners.py                                                     │
+│                                                                              │
+│ Spinner animation helper (extracted from lines 259–260):                     │
+│ - class Spinner — next() -> str, configurable character sets                 │
+│                                                                              │
+│ Demo Scripts: scripts/demos/                                                 │
+│                                                                              │
+│ Each demo covers one section from the comparison document. Each uses the     │
+│ shared demo_tui library for consistent multi-pane output. Demos are          │
+│ self-contained and runnable with uv run python scripts/demos/<name>.py.      │
+│                                                                              │
+│ scripts/demos/01_actor_abstraction.py                                        │
+│                                                                              │
+│ Concept: Actor creation and endpoint calls in Monarch vs Ray                 │
+│ - Monarch pane: Spawn PingPong actor via this_host() → spawn_procs →         │
+│ spawn("pinger", PingPong), call ping.call_one()                              │
+│ - Ray pane: @ray.remote class PingPong, actor = PingPong.remote(),           │
+│ ray.get(actor.ping.remote())                                                 │
+│ - Dashboard: ComparisonPanel showing both outputs side-by-side, LogPanel for │
+│  timeline                                                                    │
+│                                                                              │
+│ scripts/demos/02_topology_meshes.py                                          │
+│                                                                              │
+│ Concept: Mesh topology (Monarch) vs flat placement groups (Ray)              │
+│ - Monarch pane: Create multi-host mesh, mesh.slice(hosts=0), reshape         │
+│ operations                                                                   │
+│ - Ray pane: placement_group([{"CPU": 1}] * N, strategy="SPREAD"), individual │
+│  actor handles                                                               │
+│ - Dashboard: KeyValuePanel showing topology shape, LogPanel for creation     │
+│ timeline                                                                     │
+│                                                                              │
+│ scripts/demos/03_control_plane.py                                            │
+│                                                                              │
+│ Concept: Messaging patterns — call_one, call, stream, broadcast              │
+│ - Monarch pane: Demonstrate all 4 messaging patterns with an EchoActor       │
+│ - Ray pane: .remote() + ray.get(), ray.wait(), no native streaming/broadcast │
+│ - Dashboard: ProgressPanel per pattern, LogPanel showing message flow        │
+│                                                                              │
+│ scripts/demos/04_message_ordering.py                                         │
+│                                                                              │
+│ Concept: Per-sender ordered delivery (Monarch) vs optional ordering (Ray)    │
+│ - Monarch pane: Send messages out of order, show they arrive in order        │
+│ (mirrors ordering.rs test logic)                                             │
+│ - Ray pane: Show max_concurrency + _ray_allow_out_of_order_execution         │
+│ behavior                                                                     │
+│ - Dashboard: LogPanel showing send/receive order, KeyValuePanel with         │
+│ sequence numbers                                                             │
+│                                                                              │
+│ scripts/demos/05_supervision.py                                              │
+│                                                                              │
+│ Concept: Erlang-style supervision (Monarch) vs max_restarts (Ray)            │
+│ - Monarch pane: Actor with __supervise__, inject fault, show recovery via    │
+│ supervision tree                                                             │
+│ - Ray pane: Actor with max_restarts=3, inject fault, show GCS-managed        │
+│ restart                                                                      │
+│ - Dashboard: KeyValuePanel showing actor state, LogPanel showing             │
+│ fault/recovery events                                                        │
+│                                                                              │
+│ scripts/demos/06_data_plane_rdma.py                                          │
+│                                                                              │
+│ Concept: RDMA one-sided reads (Monarch) vs object store (Ray)                │
+│ - Monarch pane: RDMABuffer registration, read_into() zero-copy transfer      │
+│ (conceptual — needs RDMA hardware)                                           │
+│ - Ray pane: ray.put() / ray.get() with Plasma object store                   │
+│ - Dashboard: KeyValuePanel showing transfer stats, ComparisonPanel for       │
+│ architecture diagrams (ASCII)                                                │
+│                                                                              │
+│ scripts/demos/07_distributed_tensors.py                                      │
+│                                                                              │
+│ Concept: First-class distributed tensors (Monarch) vs manual sharding (Ray)  │
+│ - Monarch pane: DeviceMesh.activate(), distributed tensor ops, reduce(),     │
+│ inspect()                                                                    │
+│ - Ray pane: TorchTrainer with train.torch.prepare_model(), manual DDP setup  │
+│ - Dashboard: ProgressPanel for training steps, KeyValuePanel for tensor      │
+│ metadata                                                                     │
+│                                                                              │
+│ scripts/demos/08_interactive_devx.py                                         │
+│                                                                              │
+│ Concept: Single-controller SPMD (Monarch) vs job submission (Ray)            │
+│ - Monarch pane: SPMDActor, serve(), interactive endpoint calls from notebook │
+│ - Ray pane: ray.init(), remote function submission, Ray Jobs CLI             │
+│ - Dashboard: LogPanel showing interactive session, ComparisonPanel for       │
+│ workflow diagrams                                                            │
+│                                                                              │
+│ Pytest Integration Tests: tests/                                             │
+│                                                                              │
+│ tests/test_demo_tui.py                                                       │
+│                                                                              │
+│ Unit tests for the shared TUI library:                                       │
+│ - test_dashboard_base_add_panel() — panels register correctly                │
+│ - test_dashboard_base_render_layout() — render returns valid Layout          │
+│ - test_log_panel_respects_max_lines() — deque truncation works               │
+│ - test_key_value_panel_render() — formatted output matches expected          │
+│ - test_progress_panel_percentage() — progress bar math is correct            │
+│ - test_spinner_cycles() — spinner wraps around correctly                     │
+│ - test_comparison_panel_side_by_side() — two-column rendering works          │
+│ - test_gpu_monitor_fallback() — graceful degradation without nvidia-smi      │
+│                                                                              │
+│ tests/test_demo_scripts.py                                                   │
+│                                                                              │
+│ Integration tests that verify demo scripts are importable and their main     │
+│ functions are callable:                                                      │
+│ - test_demo_01_importable() — import succeeds, main function exists          │
+│ - test_demo_02_importable() through test_demo_08_importable()                │
+│ - test_demo_01_dry_run() — run with --dry-run flag (each demo supports       │
+│ this), verifying output structure without requiring actual Monarch/Ray       │
+│ clusters                                                                     │
+│ - Parametrized tests: @pytest.mark.parametrize("demo", ["01", "02", ...,     │
+│ "08"])                                                                       │
+│                                                                              │
+│ tests/conftest.py                                                            │
+│                                                                              │
+│ Shared fixtures:                                                             │
+│ - mock_console — Rich Console with file=StringIO for capturing output        │
+│ - sample_dashboard — pre-configured DashboardBase with test panels           │
+│                                                                              │
+│ Zephyr Container Infra Constraints                                           │
+│                                                                              │
+│ All code runs inside the Zephyr container using the existing scripts:        │
+│                                                                              │
+│ - Run commands: ./scripts/zephyr_uv_run.sh python                            │
+│ scripts/demos/01_actor_abstraction.py                                        │
+│ - Run tests: ./scripts/zephyr_uv_run.sh pytest tests/ -q                     │
+│ - Sync env: ./scripts/zephyr_uv_sync.sh (auto-called by zephyr_uv_run.sh)    │
+│                                                                              │
+│ Environment rules:                                                           │
+│ - Python comes from Spack at /opt/spack_store/view/bin/python                │
+│ - venv uses --system-site-packages to inherit Spack packages (torch, CUDA,   │
+│ triton, torchmonarch)                                                        │
+│ - uv NEVER installs: torch, triton, cuda-bindings, cuda-pathfinder, any      │
+│ nvidia-* or cuda-* packages, JAX                                             │
+│ - CUDA runtime libs come from /usr/local/cuda/ via LD_LIBRARY_PATH (set by   │
+│ zephyr_uv_run.sh)                                                            │
+│ - Pure-Python deps (rich, marimo, etc.) are installed by uv — rich>=13.9.0   │
+│ is already in pyproject.toml                                                 │
+│ - The demo_tui package in src/ is auto-discovered by                         │
+│ [tool.setuptools.packages.find] where = ["src"]                              │
+│ - No changes needed to pyproject.toml for new packages (rich already         │
+│ included, pytest in dev deps)                                                │
+│                                                                              │
+│ Demo scripts that need GPU/Monarch: support --dry-run mode that mocks the    │
+│ distributed runtime, so they can be tested in CI or without GPU. When        │
+│ --dry-run is set, they skip this_host(), ray.init(), etc. and use simulated  │
+│ data for the dashboard.                                                      │
+│                                                                              │
+│ Implementation Steps                                                         │
+│                                                                              │
+│ 1. Create the shared TUI library (src/demo_tui/)                             │
+│   - Extract patterns from scripts/demo_monarch_two_gpu_transformer_train.py  │
+│   - dashboard.py, gpu_monitor.py, spinners.py, __init__.py                   │
+│ 2. Write the full comparison document to docs/monarch-vs-ray-analysis.md     │
+│   - 8 sections as outlined above                                             │
+│   - Each section: concept intro (using notebook context), Monarch code +     │
+│ links, Ray code + links, comparison table                                    │
+│   - GitHub URLs for every source reference                                   │
+│   - Code snippets showing the API patterns side by side                      │
+│ 3. Create demo scripts (scripts/demos/01_*.py through scripts/demos/08_*.py) │
+│   - Each demo uses demo_tui library                                          │
+│   - Each supports --dry-run for testing without cluster resources            │
+│   - Self-contained with clear main() entry point                             │
+│ 4. Create pytest tests (tests/test_demo_tui.py, tests/test_demo_scripts.py,  │
+│ tests/conftest.py)                                                           │
+│   - Unit tests for TUI library                                               │
+│   - Import/dry-run integration tests for demo scripts                        │
+│ 5. Update pyproject.toml if needed to add demo_tui as a package              │
+│                                                                              │
+│ Verification                                                                 │
+│                                                                              │
+│ - All GitHub URLs constructed correctly from confirmed file paths            │
+│ - Code examples match the actual API signatures verified via file reads      │
+│ - Notebook references match actual notebook content (already deeply          │
+│ explored)                                                                    │
+│ - Document renders correctly as GitHub-flavored markdown                     │
+│ - ./scripts/zephyr_uv_run.sh pytest tests/ -q passes all tests               │
+│ - ./scripts/zephyr_uv_run.sh python scripts/demos/01_actor_abstraction.py    │
+│ --dry-run runs without errors                                                │
+│ - Each demo script is independently runnable via ./scripts/zephyr_uv_run.sh  │
+│ - No CUDA/torch/jax packages appear in uv install output                     │
+╰──────────────────────────────────────────────────────────────────────────────╯
+
+● I'll implement this comprehensive plan. Let me start by reading the key
+  reference files to understand the existing patterns, then work through the
+  implementation steps.
+
+● Let me read the existing reference files first.
+
+● Searched for 1 pattern, read 2 files (ctrl+o to expand)
+
+● Good. Now let me read a few notebooks to get the right context for the
+  comparison document, and check if there's an existing analysis file.
+
+● Searched for 1 pattern, read 2 files (ctrl+o to expand)
+
+● Now I have a good understanding of the codebase. This is a large
+  implementation task, so I'll parallelize the work by launching multiple agents
+   for independent pieces. Let me start by creating the TUI library and the
+  comparison document in parallel, then follow up with the demo scripts and
+  tests.
+
+● Task(Create demo_tui library files)
+  ⎿  Backgrounded agent (shift+↑ to manage · ctrl+o to expand)
+
+● Let me check on the TUI library agent and start working on the comparison
+  document in parallel.
+
+● Task Output(non-blocking) a00543e
+  ⎿  Task is still running…
+
+● The TUI library agent is still working. Let me start on the comparison
+  document and demo scripts in parallel.
+
+● Let me read the existing analysis file fully and some key notebooks to build
+  the comprehensive document.
+
+● Read 3 files (ctrl+o to expand)
+
+● Good, I have the existing analysis and notebook context. Now let me write the
+  comprehensive comparison document. This is a large file, so I'll write it
+  directly.
+
+● Write(docs/monarch-vs-ray-analysis.md)
+  ⎿  Added 764 lines, removed 115 lines
+       1 -# Monarch vs Ray: Actors, Messaging, and Supervision           
+       1 +# Monarch vs Ray: A Comprehensive Technical Comparison         
+       2  
+       3 -A technical comparison based on the Monarch notebook series (th
+         -is repo) and the Ray codebase at `/home/phi9t/workspace/ray`.  
+       3 +A deep technical comparison of [PyTorch Monarch](https://github
+         +.com/pytorch/monarch) and [Ray](https://github.com/ray-project/
+         +ray), covering actors, control plane messaging, supervision, da
+         +ta plane (RDMA), distributed tensors, and interactive developme
+         +nt. Each section includes side-by-side code examples and links 
+         +to the actual source implementations.                          
+       4  
+       5 +**Monarch commit**: [`febefda`](https://github.com/pytorch/mona
+         +rch/tree/febefda69e1f9e9a696596b3de368ac557320b21)             
+       6 +**Ray commit**: [`25da710`](https://github.com/ray-project/ray/
+         +tree/25da7108abbec7606e8e0ce057e3a5d22421850f)                 
+       7 +                                                               
+       8 +**Companion notebooks**: The Monarch side of each concept maps 
+         +to a notebook in this repo's `notebooks/` directory. See [01–08
+         +](../notebooks/) for interactive walkthroughs.                 
+       9 +                                                               
+      10  ---
+      11  
+       7 -## 1. The Actor Abstraction                                    
+      12 +## Table of Contents                                           
+      13  
+       9 -**Monarch** — actors are Python classes that inherit from `Acto
+         -r`. Methods are exposed via the `@endpoint` decorator, creating
+         - typed, named RPC entry points:                                
+      14 +1. [Actor Abstraction](#1-actor-abstraction)                   
+      15 +2. [Topology — Meshes vs Flat Handles](#2-topology--meshes-vs-f
+         +lat-handles)                                                   
+      16 +3. [Control Plane Messaging](#3-control-plane-messaging)       
+      17 +4. [Message Ordering Guarantees](#4-message-ordering-guarantees
+         +)                                                              
+      18 +5. [Supervision and Fault Tolerance](#5-supervision-and-fault-t
+         +olerance)                                                      
+      19 +6. [Data Plane — RDMA vs Object Store](#6-data-plane--rdma-vs-o
+         +bject-store)                                                   
+      20 +7. [Distributed Tensors and Training](#7-distributed-tensors-an
+         +d-training)                                                    
+      21 +8. [Interactive DevX (Single Controller)](#8-interactive-devx-s
+         +ingle-controller)                                              
+      22 +9. [Design Philosophy Summary](#9-design-philosophy-summary)   
+      23  
+      24 +---                                                            
+      25 +                                                               
+      26 +## 1. Actor Abstraction                                        
+      27 +                                                               
+      28 +> **Notebook ref**: [`notebooks/01_history_and_vision.py`](../n
+         +otebooks/01_history_and_vision.py) — PingPong actor, mesh spawn
+         +ing, endpoint calls.                                           
+      29 +                                                               
+      30 +### Monarch                                                    
+      31 +                                                               
+      32 +Actors are Python classes that inherit from `Actor`. Methods ar
+         +e exposed via the `@endpoint` decorator, creating typed, named 
+         +RPC entry points. Spawning is topology-aware: you first create 
+         +a `ProcMesh` (a structured grid of processes), then spawn actor
+         +s on it, getting back an `ActorMesh`.                          
+      33 +                                                               
+      34  ```python
+      12 -# Monarch (from notebooks/01_history_and_vision.py:183-196)    
+      35 +# Monarch actor definition                                     
+      36 +from monarch.actor import Actor, endpoint, current_rank, this_h
+         +ost                                                            
+      37 +                                                               
+      38  class PingPong(Actor):
+      39      def __init__(self):
+      40          self.name = "Ping" if current_rank().rank == 0 else "Po
+          ng"
+     ...
+      43      @endpoint
+      44      def ping(self, message: str) -> str:
+      45          self.count += 1
+      21 -        return f"pong from {self.name}"                        
+      46 +        return f"pong from {self.name} (count={self.count})"   
+      47  
+      23 -# Spawn: mesh-aware, returns an ActorMesh                      
+      48 +# Spawn: two-step, mesh-aware                                  
+      49 +host = this_host()                                             
+      50  procs = host.spawn_procs(per_host={"gpus": 2})
+      51  actors = procs.spawn("players", PingPong)
+      52 +                                                               
+      53 +# Call: returns structured result                              
+      54 +result = actors.ping.call_one("hello").get()                   
+      55  ```
+      56  
+      28 -**Ray** — actors are regular Python classes decorated with `@ra
+         -y.remote`. Every public method is implicitly callable remotely:
+      57 +**Source links:**                                              
+      58 +- [`Actor` base class](https://github.com/pytorch/monarch/blob/
+         +febefda69e1f9e9a696596b3de368ac557320b21/python/monarch/_src/ac
+         +tor/actor_mesh.py#L1569) — `class Actor(MeshTrait)`            
+      59 +- [`ActorMesh`](https://github.com/pytorch/monarch/blob/febefda
+         +69e1f9e9a696596b3de368ac557320b21/python/monarch/_src/actor/act
+         +or_mesh.py#L1606) — `class ActorMesh(Generic[T])`              
+      60 +- [`@endpoint` decorator](https://github.com/pytorch/monarch/bl
+         +ob/febefda69e1f9e9a696596b3de368ac557320b21/python/monarch/_src
+         +/actor/endpoint.py#L509)                                       
+      61  
+      62 +### Ray                                                        
+      63 +                                                               
+      64 +Actors are regular Python classes decorated with `@ray.remote`.
+         + Every public method is implicitly callable remotely. Spawning 
+         +is a single step: `Class.remote()` returns an opaque `ActorHand
+         +le`, and the scheduler picks a node.                           
+      65 +                                                               
+      66  ```python
+      31 -# Ray (from python/ray/actor.py:1201-1368)                     
+      67 +# Ray actor definition                                         
+      68 +import ray                                                     
+      69 +                                                               
+      70  @ray.remote
+      71  class Counter:
+      72      def __init__(self):
+     ...
+       76          self.count += 1
+       77          return self.count
+       78  
+       41 -# Spawn: returns an ActorHandle (opaque proxy)                
+       79 +# Spawn: single-step, scheduler picks node                    
+       80  counter = Counter.remote()
+       81 +                                                              
+       82 +# Call: returns ObjectRef, resolve with ray.get()             
+       83 +ref = counter.increment.remote()                              
+       84 +result = ray.get(ref)                                         
+       85  ```
+       86  
+       45 -**Key differences:**                                          
+       87 +**Source links:**                                             
+       88 +- [`ActorClass`](https://github.com/ray-project/ray/blob/25da7
+          +108abbec7606e8e0ce057e3a5d22421850f/python/ray/actor.py#L1201)
+          + — `class ActorClass(Generic[T])`                             
+       89 +- [`ActorClass.remote()`](https://github.com/ray-project/ray/b
+          +lob/25da7108abbec7606e8e0ce057e3a5d22421850f/python/ray/actor.
+          +py#L1356) — actor creation entry point                        
+       90 +- [`ActorHandle`](https://github.com/ray-project/ray/blob/25da
+          +7108abbec7606e8e0ce057e3a5d22421850f/python/ray/actor.py#L1886
+          +) — `class ActorHandle(Generic[T])`                           
+       91 +- [`ActorClass._remote()`](https://github.com/ray-project/ray/
+          +blob/25da7108abbec7606e8e0ce057e3a5d22421850f/python/ray/actor
+          +.py#L1511) — full creation path with all options              
+       92  
+       93 +### Comparison                                                
+       94 +                                                              
+       95  | Aspect | Monarch | Ray |
+       96  |--------|---------|-----|
+       97  | **Base class** | Explicit `Actor` inheritance | `@ray.remote
+           ` decorator on any class |
+       50 -| **Method exposure** | Opt-in via `@endpoint` | Opt-out (all 
+          -methods are remote by default) |                              
+       98 +| **Method exposure** | Opt-in via `@endpoint` | Opt-out (all 
+          +public methods are remote by default) |                       
+       99  | **Spawn model** | Two-step: `spawn_procs()` then `spawn()` o
+           n a ProcMesh | Single-step: `Class.remote()`, scheduler picks 
+           node |
+      100  | **Return type** | `ActorMesh` (collective-addressable group)
+            | `ActorHandle` (single actor proxy) |
+       53 -| **Invocation** | `actor.method.call_one().get()` / `actors.m
+          -ethod.call().get()` | `actor.method.remote()` returns `ObjectR
+          -ef`, then `ray.get()` |                                       
+       54 -| **Message ordering** | **Guaranteed**: messages from A to B 
+          -arrive in order; each actor processes messages **sequentially*
+          -* | **Not guaranteed** by default; `allow_out_of_order_executi
+          -on` flag exists (`actor_handle.h:51`) |                       
+       55 -| **Concurrency within actor** | Sequential by default (one me
+          -ssage at a time). Different actors in the same process run con
+          -currently | Configurable via `max_concurrency`. Defaults diffe
+          -r for sync vs async actors |                                  
+       56 -| **Actor inheritance** | Supported (normal Python inheritance
+          - from `Actor`) | **Explicitly blocked** — `ActorClassInheritan
+          -ceException` raised if you try to subclass an `ActorClass` (`a
+          -ctor.py:1226`) |                                              
+      101 +| **Invocation** | `actor.method.call_one().get()` | `ray.get(
+          +actor.method.remote())` |                                     
+      102 +| **Concurrency** | Sequential by default (one message at a ti
+          +me) | Configurable via `max_concurrency` |                    
+      103 +| **Actor inheritance** | Supported (normal Python inheritance
+          + from `Actor`) | Blocked — `ActorClassInheritanceException` ra
+          +ised |                                                        
+      104  
+      105  ---
+      106  
+       60 -## 2. Topology: Meshes vs Flat Handles                        
+      107 +## 2. Topology — Meshes vs Flat Handles                       
+      108  
+       62 -This is the deepest architectural divergence.                 
+      109 +> **Notebook ref**: [`notebooks/04_distributed_tensors.py`](..
+          +/notebooks/04_distributed_tensors.py) — mesh creation, reshape
+          +, slicing, distributed tensor ops.                            
+      110  
+       64 -**Monarch** builds around **multidimensional meshes**. A `Proc
+          -Mesh` is a structured grid of processes with named dimensions 
+          -(e.g., `{"dp": 4, "tp": 8}`). An `ActorMesh` spawned on it inh
+          -erits that structure. You address actors by slicing:          
+      111 +This is the deepest architectural divergence between Monarch a
+          +nd Ray.                                                       
+      112  
+      113 +### Monarch                                                   
+      114 +                                                              
+      115 +Monarch builds around **multidimensional meshes**. A `ProcMesh
+          +` is a structured grid of processes with named dimensions (e.g
+          +., `{"dp": 4, "tp": 8}`). An `ActorMesh` spawned on it inherit
+          +s that structure. You address actors by slicing dimensions:   
+      116 +                                                              
+      117  ```python
+       67 -# From NB04 (04_distributed_tensors.py:49-51, 228-233)        
+       68 -mesh = this_host().spawn_procs({"gpu": 8})                    
+       69 -mesh_2d = remote_mesh.rename(host="dp", gpu="tp")             
+       70 -mesh_3d = remote_mesh.split(host=("dp", "pp"), gpu=("tp",), pp
+          -=2)                                                           
+      118 +# Create a mesh — structured grid with named dimensions       
+      119 +host = this_host()                                            
+      120 +mesh = host.spawn_procs({"gpu": 8})                           
+      121 +print(mesh.to_table())                                        
+      122 +# gpu | host | rank                                           
+      123 +# 0   | 0    | 0                                              
+      124 +# 1   | 0    | 1                                              
+      125 +# ...                                                         
+      126  
+      127 +# Reshape: split a dimension into multiple                    
+      128 +mesh_2d = mesh.rename(gpu="tp")  # just rename                
+      129 +mesh_3d = mesh.split(host=("dp", "pp"), gpu=("tp",), pp=2)    
+      130 +                                                              
+      131  # Addressing: slice by dimension
+       73 -ping_actor = actors.slice(gpus=0)          # single actor     
+      132 +single_actor = actors.slice(gpus=0)       # one actor         
+      133  dp_group = actors.slice(dp=2)             # all actors at dp=2
+      134 +                                                              
+      135 +# Broadcast: O(log N) tree-based routing                      
+      136 +results = actors.method.call(data).get()  # returns ValueMesh 
+      137  ```
+      138  
+      139  The mesh enables **O(log N) broadcast** via tree-based routing
+            and **O(log N) reduce** for aggregating responses — the runti
+           me routes through intermediate hosts automatically.
+      140  
+       79 -**Ray** has no native mesh concept. Actors are individually ad
+          -dressed by `ActorHandle` (backed by `ActorID` — `actor_handle.
+          -h:64`). Grouping is done ad-hoc:                              
+      141 +**Source links:**                                             
+      142 +- [`ProcMesh`](https://github.com/pytorch/monarch/blob/febefda
+          +69e1f9e9a696596b3de368ac557320b21/python/monarch/_src/actor/pr
+          +oc_mesh.py#L234)                                              
+      143 +- [`HostMesh.spawn_procs()`](https://github.com/pytorch/monarc
+          +h/blob/febefda69e1f9e9a696596b3de368ac557320b21/python/monarch
+          +/_src/actor/host_mesh.py#L145)                                
+      144 +- [`this_host()`](https://github.com/pytorch/monarch/blob/febe
+          +fda69e1f9e9a696596b3de368ac557320b21/python/monarch/_src/actor
+          +/host_mesh.py#L48)                                            
+      145 +- [Rust `ProcMesh`](https://github.com/pytorch/monarch/blob/fe
+          +befda69e1f9e9a696596b3de368ac557320b21/hyperactor_mesh/src/pro
+          +c_mesh.rs)                                                    
+      146 +- [Rust `ActorMesh`](https://github.com/pytorch/monarch/blob/f
+          +ebefda69e1f9e9a696596b3de368ac557320b21/hyperactor_mesh/src/ac
+          +tor_mesh.rs)                                                  
+      147 +- [Tree-based broadcast (`multicast.rs`)](https://github.com/p
+          +ytorch/monarch/blob/febefda69e1f9e9a696596b3de368ac557320b21/h
+          +yperactor_mesh/src/comm/multicast.rs)                         
+      148  
+       81 -- **Placement Groups** (`python/ray/util/placement_group.py:42
+          -`) — reserve bundles of resources with strategies like `PACK`,
+          - `SPREAD`, `STRICT_PACK`, `STRICT_SPREAD`. But they're a sched
+          -uling constraint, not an addressable collective.              
+       82 -- **Actor Pools** — Ray Serve builds actor pools on top, but t
+          -here's no built-in `ActorMesh` equivalent.                    
+      149 +### Ray                                                       
+      150  
+       84 -To broadcast to N actors in Ray, you call `.remote()` N times 
+          -and gather N `ObjectRef`s:                                    
+      151 +Ray has no native mesh concept. Actors are individually addres
+          +sed by `ActorHandle` (backed by `ActorID`). Grouping is done a
+          +d-hoc:                                                        
+      152  
+      153  ```python
+       87 -# Ray: manual fan-out                                         
+       88 -refs = [actor.method.remote(data) for actor in actors]        
+       89 -results = ray.get(refs)                                       
+      154 +# Ray: PlacementGroup for co-location (scheduling constraint, 
+          +not a collective)                                             
+      155 +from ray.util.placement_group import placement_group          
+      156  
+       91 -# Monarch: single broadcast, structured response              
+       92 -results = actors.method.call(data).get()  # returns ValueMesh 
+      157 +pg = placement_group(                                         
+      158 +    [{"CPU": 1, "GPU": 1}] * 8,                               
+      159 +    strategy="SPREAD"  # or PACK, STRICT_PACK, STRICT_SPREAD  
+      160 +)                                                             
+      161 +ray.get(pg.ready())                                           
+      162 +                                                              
+      163 +# Actors placed within the group                              
+      164 +actors = [                                                    
+      165 +    Worker.options(                                           
+      166 +        scheduling_strategy=PlacementGroupSchedulingStrategy( 
+      167 +            placement_group=pg, placement_group_bundle_index=i
+      168 +        )                                                     
+      169 +    ).remote()                                                
+      170 +    for i in range(8)                                         
+      171 +]                                                             
+      172 +                                                              
+      173 +# Broadcast: manual fan-out, O(N) calls                       
+      174 +refs = [actor.method.remote(data) for actor in actors]        
+      175 +results = ray.get(refs)  # list, no structure                 
+      176  ```
+      177  
+       95 -The `ValueMesh` maps each actor's position (coordinates in the
+          - mesh) to its return value — structure is preserved.          
+      178 +Placement groups are a **scheduling constraint**, not an addre
+          +ssable collective. There's no `slice()`, `reshape()`, or tree-
+          +routing.                                                      
+      179  
+      180 +**Source links:**                                             
+      181 +- [`PlacementGroup`](https://github.com/ray-project/ray/blob/2
+          +5da7108abbec7606e8e0ce057e3a5d22421850f/python/ray/util/placem
+          +ent_group.py#L42)                                             
+      182 +- [`placement_group()` function](https://github.com/ray-projec
+          +t/ray/blob/25da7108abbec7606e8e0ce057e3a5d22421850f/python/ray
+          +/util/placement_group.py#L146)                                
+      183 +- [C++ Placement Group Resource Manager](https://github.com/ra
+          +y-project/ray/blob/25da7108abbec7606e8e0ce057e3a5d22421850f/sr
+          +c/ray/raylet/placement_group_resource_manager.h#L49)          
+      184 +                                                              
+      185 +### Comparison                                                
+      186 +                                                              
+      187 +| Aspect | Monarch | Ray |                                    
+      188 +|--------|---------|-----|                                    
+      189 +| **Topology model** | Multidimensional named mesh (`ProcMesh`
+          +) | Flat list of `ActorHandle`s |                             
+      190 +| **Grouping** | First-class: meshes with dimensions, slice, r
+          +eshape | Ad-hoc: `PlacementGroup` (scheduling only) |         
+      191 +| **Addressing** | By dimension coordinates: `actors.slice(dp=
+          +2)` | By index in a Python list |                             
+      192 +| **Broadcast** | O(log N) tree-based via `call()` / `broadcas
+          +t()` | O(N) manual fan-out with list comprehension |          
+      193 +| **Aggregation** | `ValueMesh` preserves mesh structure in re
+          +sults | Plain Python list of results |                        
+      194 +| **Reshape** | Runtime: `mesh.split()`, `mesh.rename()` | N/A
+          + — rebuild placement group |                                  
+      195 +| **Multi-host** | `HostMesh` -> `ProcMesh` spans hosts native
+          +ly | PlacementGroup with `SPREAD` strategy |                  
+      196 +                                                              
+      197  ---
+      198  
+       99 -## 3. Control Plane and Messaging                             
+      199 +## 3. Control Plane Messaging                                 
+      200  
+      101 -**Ray's control plane** is a three-tier architecture:         
+      201 +> **Notebook ref**: [`notebooks/01_history_and_vision.py`](../
+          +notebooks/01_history_and_vision.py) — Channels, Ports, message
+          + ordering, endpoint patterns.                                 
+      202  
+      103 -1. **GCS (Global Control Store)** — centralized metadata serve
+          -r (`src/ray/gcs/gcs_server.h`). Manages `GcsActorManager`, `Gc
+          -sNodeManager`, `GcsJobManager`, `GcsWorkerManager`. Backed by 
+          -Redis or in-memory store. Tracks actor locations, node livenes
+          -s, resource availability.                                     
+      203 +### Monarch                                                   
+      204  
+      105 -2. **Raylet (Node Manager)** — per-node daemon (`src/ray/rayle
+          -t/node_manager.h`). Manages local worker pool, object store (P
+          -lasma), local scheduling. Leases workers from the cluster sche
+          -duler.                                                        
+      205 +Monarch provides four messaging patterns, all built on the pri
+          +mitive of **Ports** (typed channels):                         
+      206  
+      107 -3. **CoreWorker** — per-process runtime (`src/ray/core_worker/
+          -core_worker.h`). Handles task submission, object resolution, r
+          -eference counting. Each actor lives inside a CoreWorker.      
+      207 +```python                                                     
+      208 +from monarch.actor import Actor, endpoint, Channel            
+      209  
+      109 -Message flow for a method call:                               
+      210 +class EchoActor(Actor):                                       
+      211 +    @endpoint                                                 
+      212 +    def echo(self, msg: str) -> str:                          
+      213 +        return f"echo: {msg}"                                 
+      214 +                                                              
+      215 +    @endpoint                                                 
+      216 +    def stream_data(self, port: Port[str], count: int) -> None
+          +:                                                             
+      217 +        for i in range(count):                                
+      218 +            port.send(f"item {i}")                            
+      219 +                                                              
+      220 +# Pattern 1: call_one() — single actor, request-response      
+      221 +result = actor.echo.call_one("hello").get()                   
+      222 +                                                              
+      223 +# Pattern 2: call() — broadcast to all actors in mesh, collect
+          + responses                                                    
+      224 +results = actors.echo.call("hello").get()  # returns ValueMesh
+      225 +                                                              
+      226 +# Pattern 3: stream() — receive async stream of values        
+      227 +async for item in actors.stream_data.stream(count=10):        
+      228 +    print(item)                                               
+      229 +                                                              
+      230 +# Pattern 4: broadcast() — fire-and-forget to all actors      
+      231 +actors.echo.broadcast("hello")  # no response expected        
+      232 +                                                              
+      233 +# Low-level: Ports and Channels                               
+      234 +port, receiver = Channel.open(str)                            
+      235 +actor.stream_data.call_one(port, count=5)                     
+      236 +async for msg in receiver:                                    
+      237 +    print(msg)                                                
+      238  ```
+      111 -caller CoreWorker -> gRPC -> target node's Raylet -> target Co
+          -reWorker -> execute method                                    
+      112 -                                                              
+          -         -> return ObjectRef                                  
+      113 -caller: ray.get(ref) -> resolve via ownership protocol -> fetc
+          -h object                                                      
+      239 +                                                              
+      240 +The underlying messaging infrastructure is built on a **Rust m
+          +ailbox system** — every actor has a `Mailbox` with typed `Port
+          +`s for sending and `PortReceiver`s for receiving.             
+      241 +                                                              
+      242 +**Source links:**                                             
+      243 +- [`call_one()`](https://github.com/pytorch/monarch/blob/febef
+          +da69e1f9e9a696596b3de368ac557320b21/python/monarch/_src/actor/
+          +endpoint.py#L241)                                             
+      244 +- [`call()` (broadcast)](https://github.com/pytorch/monarch/bl
+          +ob/febefda69e1f9e9a696596b3de368ac557320b21/python/monarch/_sr
+          +c/actor/endpoint.py#L268)                                     
+      245 +- [`stream()`](https://github.com/pytorch/monarch/blob/febefda
+          +69e1f9e9a696596b3de368ac557320b21/python/monarch/_src/actor/en
+          +dpoint.py#L305)                                               
+      246 +- [`broadcast()` (fire-and-forget)](https://github.com/pytorch
+          +/monarch/blob/febefda69e1f9e9a696596b3de368ac557320b21/python/
+          +monarch/_src/actor/endpoint.py#L343)                          
+      247 +- [Port, PortReceiver, Mailbox type stubs](https://github.com/
+          +pytorch/monarch/blob/febefda69e1f9e9a696596b3de368ac557320b21/
+          +python/monarch/_rust_bindings/monarch_hyperactor/mailbox.pyi) 
+      248 +- [Rust `mailbox.rs`](https://github.com/pytorch/monarch/blob/
+          +febefda69e1f9e9a696596b3de368ac557320b21/hyperactor/src/mailbo
+          +x.rs) (3977 lines — the core messaging engine)                
+      249 +                                                              
+      250 +### Ray                                                       
+      251 +                                                              
+      252 +Ray has a simpler messaging model: every method call returns a
+          +n `ObjectRef`, which you resolve with `ray.get()` or check wit
+          +h `ray.wait()`. There's no native streaming or fire-and-forget
+          +.                                                             
+      253 +                                                              
+      254 +```python                                                     
+      255 +import ray                                                    
+      256 +                                                              
+      257 +@ray.remote                                                   
+      258 +class EchoActor:                                              
+      259 +    def echo(self, msg: str) -> str:                          
+      260 +        return f"echo: {msg}"                                 
+      261 +                                                              
+      262 +    def generate_items(self, count: int) -> list[str]:        
+      263 +        return [f"item {i}" for i in range(count)]            
+      264 +                                                              
+      265 +# Pattern 1: Single call — .remote() returns ObjectRef        
+      266 +ref = actor.echo.remote("hello")                              
+      267 +result = ray.get(ref)                                         
+      268 +                                                              
+      269 +# Pattern 2: Fan-out to multiple actors                       
+      270 +refs = [a.echo.remote("hello") for a in actors]               
+      271 +results = ray.get(refs)                                       
+      272 +                                                              
+      273 +# Pattern 3: No native streaming — return a list or use ray.wa
+          +it() for polling                                              
+      274 +refs = [actor.generate_items.remote(10)]                      
+      275 +done, pending = ray.wait(refs, num_returns=1, timeout=5.0)    
+      276 +                                                              
+      277 +# Pattern 4: No fire-and-forget — every call produces an Objec
+          +tRef                                                          
+      278 +# (Closest: call .remote() and discard the ref)               
+      279 +_ = actor.echo.remote("hello")  # still creates an ObjectRef  
+      280  ```
+      281  
+      116 -The **ownership model** is key: the process that creates an `O
+          -bjectRef` is the **owner** of that object (`actor_handle.h:40-
+          -41` — `owner_id`, `owner_address`). Object metadata and lineag
+          -e live with the owner, not in GCS. This distributes the metada
+          -ta load but means if the owner dies, the object's lineage is l
+          -ost.                                                          
+      282 +Under the hood, Ray uses a **three-tier architecture**: GCS (G
+          +lobal Control Store) for metadata, Raylet (per-node daemon) fo
+          +r local scheduling, and CoreWorker (per-process runtime) for t
+          +ask execution and object management.                          
+      283  
+      118 -**Monarch's control plane** is fundamentally different — it's 
+          -**actors all the way down**:                                  
+      284 +**Source links:**                                             
+      285 +- [`ActorMethod._remote()`](https://github.com/ray-project/ray
+          +/blob/25da7108abbec7606e8e0ce057e3a5d22421850f/python/ray/acto
+          +r.py#L802) — remote method invocation                         
+      286 +- [`ObjectRef`](https://github.com/ray-project/ray/blob/25da71
+          +08abbec7606e8e0ce057e3a5d22421850f/python/ray/includes/object_
+          +ref.pxi#L37) (Cython)                                         
+      287 +- [`ray.get()`](https://github.com/ray-project/ray/blob/25da71
+          +08abbec7606e8e0ce057e3a5d22421850f/python/ray/_private/worker.
+          +py#L2858)                                                     
+      288 +- [`ray.wait()`](https://github.com/ray-project/ray/blob/25da7
+          +108abbec7606e8e0ce057e3a5d22421850f/python/ray/_private/worker
+          +.py#L3074)                                                    
+      289 +- [C++ `CoreWorker`](https://github.com/ray-project/ray/blob/2
+          +5da7108abbec7606e8e0ce057e3a5d22421850f/src/ray/core_worker/co
+          +re_worker.h#L167)                                             
+      290 +- [GCS Server](https://github.com/ray-project/ray/blob/25da710
+          +8abbec7606e8e0ce057e3a5d22421850f/src/ray/gcs/gcs_server.h#L98
+          +)                                                             
+      291 +- [Raylet NodeManager](https://github.com/ray-project/ray/blob
+          +/25da7108abbec7606e8e0ce057e3a5d22421850f/src/ray/raylet/node_
+          +manager.h#L70)                                                
+      292 +- [C++ `ActorHandle` (ownership)](https://github.com/ray-proje
+          +ct/ray/blob/25da7108abbec7606e8e0ce057e3a5d22421850f/src/ray/c
+          +ore_worker/actor_handle.h#L34)                                
+      293  
+      120 -- No separate GCS/Raylet daemons. The Rust runtime manages pro
+          -cesses and message routing.                                   
+      121 -- **Single controller** paradigm: one Python process (the note
+          -book/script) orchestrates all actors via endpoint calls. There
+          -'s no distributed scheduler deciding where actors go — you exp
+          -licitly create `ProcMesh` topologies and spawn actors on them.
+      122 -- Messaging uses **Ports** (`Channel.open()` gives a `Port` + 
+          -`PortReceiver`) — the primitive underneath `call`, `broadcast`
+          -, `send`, `stream`. All higher-level patterns compose from thi
+          -s.                                                            
+      123 -- Even infrastructure uses actors: `RdmaController` is a `get_
+          -or_spawn_controller` singleton actor (`07b_weight_sync_deep_di
+          -ve.py:197-222`), `ServiceRegistry` is a singleton actor for di
+          -scovery.                                                      
+      294 +### Comparison                                                
+      295  
+      296  | Aspect | Monarch | Ray |
+      297  |--------|---------|-----|
+      298 +| **Messaging patterns** | 4: `call_one`, `call`, `stream`, `b
+          +roadcast` | 1: `.remote()` → `ObjectRef` |                    
+      299 +| **Fire-and-forget** | Native `broadcast()` | Discard `Object
+          +Ref` (still created) |                                        
+      300 +| **Streaming** | Native `stream()` with async iteration | No 
+          +native support (return lists, poll with `ray.wait`) |         
+      301 +| **Result type** | Inline `.get()` or `ValueMesh` | `ObjectRe
+          +f` → `ray.get()` |                                            
+      302 +| **Low-level primitive** | `Port` / `PortReceiver` (typed cha
+          +nnels) | `ObjectRef` with ownership protocol |                
+      303  | **Architecture** | Single controller + Rust actor runtime | 
+           GCS + Raylet + CoreWorker (3-tier) |
+      128 -| **Scheduling** | Explicit: you build `ProcMesh` topology, sp
+          -awn actors on it | Implicit: `@ray.remote(num_gpus=1)`, schedu
+          -ler picks node |                                              
+      304 +| **Metadata store** | None (controller holds references) | GC
+          +S (Redis or in-memory) |                                      
+      305  | **Message routing** | Tree-based through mesh hierarchy | Di
+           rect gRPC between CoreWorkers |
+      130 -| **Object model** | Return values are inline (`.get()` blocks
+          - for result) | `ObjectRef` with distributed reference counting
+          - + ownership |                                                
+      131 -| **Metadata store** | None (controller holds all references) 
+          -| GCS (Redis-backed or in-memory) |                           
+      132 -| **Data transport** | RDMA for bulk transfers (`RDMABuffer`),
+          - actor messages for control | Object store (Plasma/shared memo
+          -ry) for data, gRPC for control. NCCL/Gloo via `ray.util.collec
+          -tive` |                                                       
+      306  
+      307  ---
+      308  
+      136 -## 4. Fault Tolerance and Supervision                         
+      309 +## 4. Message Ordering Guarantees                             
+      310  
+      138 -**Monarch** has an explicit **Erlang-style supervision tree**:
+      311 +> **Notebook ref**: [`notebooks/01_history_and_vision.py`](../
+          +notebooks/01_history_and_vision.py) — message ordering section
+          + demonstrating FIFO guarantees.                               
+      312  
+      313 +### Monarch                                                   
+      314 +                                                              
+      315 +Monarch provides **per-sender FIFO ordering**: messages from a
+          +ctor A to actor B are guaranteed to arrive in the order they w
+          +ere sent. This is enforced at the Rust level via per-client se
+          +quence numbers:                                               
+      316 +                                                              
+      317  ```python
+      141 -# From NB03 (03_fault_tolerance.py:107-114)                   
+      142 -class SupervisorActor(Actor):                                 
+      143 -    def __supervise__(self, failure: MeshFailure):            
+      144 -        print(f"Failure: {failure}")                          
+      145 -        return True   # handled -- stop propagation           
+      146 -        # return False -> escalate to my supervisor           
+      318 +# Monarch: messages arrive in send order — guaranteed         
+      319 +class OrderedReceiver(Actor):                                 
+      320 +    def __init__(self):                                       
+      321 +        self.received = []                                    
+      322 +                                                              
+      323 +    @endpoint                                                 
+      324 +    def receive(self, seq: int) -> None:                      
+      325 +        self.received.append(seq)                             
+      326 +                                                              
+      327 +    @endpoint                                                 
+      328 +    def get_order(self) -> list[int]:                         
+      329 +        return self.received                                  
+      330 +                                                              
+      331 +# Send messages 0..9 — they arrive in order                   
+      332 +for i in range(10):                                           
+      333 +    receiver.receive.broadcast(i)                             
+      334 +                                                              
+      335 +order = receiver.get_order.call_one().get()                   
+      336 +assert order == list(range(10))  # guaranteed                 
+      337  ```
+      338  
+      149 -The semantics are precise:                                    
+      150 -- Every actor has a **parent** (the actor that called `spawn()
+          -`). The parent is the supervisor.                             
+      151 -- When a child crashes, `__supervise__` is called on the paren
+          -t with a `MeshFailure`.                                       
+      152 -- Return `True` -> handled locally. Return `False` -> propagat
+          -e up the tree.                                                
+      153 -- If nothing handles it, `unhandled_fault_hook` fires at the c
+          -lient (default: crash with exit code 1).                      
+      154 -- This gives you **one structured chain** showing exactly what
+          - failed and how it propagated — instead of grepping 16,000 log
+          - files.                                                       
+      339 +The ordering is implemented in the Rust runtime via `BufferSta
+          +te` and `OrderedSender`, which maintain per-client sequence nu
+          +mbers and buffer out-of-order messages until gaps are filled. 
+      340  
+      341 +**Source links:**                                             
+      342 +- [`ordering.rs`](https://github.com/pytorch/monarch/blob/febe
+          +fda69e1f9e9a696596b3de368ac557320b21/hyperactor/src/ordering.r
+          +s#L25-L50) — `BufferState`, `OrderedSender` with per-client se
+          +quence numbers                                                
+      343 +                                                              
+      344 +### Ray                                                       
+      345 +                                                              
+      346 +Ray does **not guarantee message ordering by default**. Actors
+          + have an `allow_out_of_order_execution` flag that explicitly o
+          +pts in to out-of-order processing for performance:            
+      347 +                                                              
+      348 +```python                                                     
+      349 +# Ray: ordering depends on configuration                      
+      350 +@ray.remote(max_concurrency=1)                                
+      351 +class OrderedActor:                                           
+      352 +    """With max_concurrency=1, tasks execute sequentially in F
+          +IFO order."""                                                 
+      353 +    def __init__(self):                                       
+      354 +        self.received = []                                    
+      355 +                                                              
+      356 +    def receive(self, seq: int):                              
+      357 +        self.received.append(seq)                             
+      358 +                                                              
+      359 +    def get_order(self) -> list[int]:                         
+      360 +        return self.received                                  
+      361 +                                                              
+      362 +# With max_concurrency=1, sequential execution gives apparent 
+          +ordering                                                      
+      363 +# But this is NOT a messaging guarantee — it's a concurrency c
+          +onstraint                                                     
+      364 +                                                              
+      365 +# Explicit opt-in to out-of-order for performance:            
+      366 +@ray.remote                                                   
+      367 +class FastActor:                                              
+      368 +    _ray_allow_out_of_order_execution = True                  
+      369 +    # Tasks may execute in any order for higher throughput    
+      370 +```                                                           
+      371 +                                                              
+      372 +**Source links:**                                             
+      373 +- [C++ `allow_out_of_order_execution` flag](https://github.com
+          +/ray-project/ray/blob/25da7108abbec7606e8e0ce057e3a5d22421850f
+          +/src/ray/core_worker/actor_handle.h#L51)                      
+      374 +- [Python `_ray_allow_out_of_order_execution`](https://github.
+          +com/ray-project/ray/blob/25da7108abbec7606e8e0ce057e3a5d224218
+          +50f/python/ray/actor.py#L1937)                                
+      375 +                                                              
+      376 +### Comparison                                                
+      377 +                                                              
+      378 +| Aspect | Monarch | Ray |                                    
+      379 +|--------|---------|-----|                                    
+      380 +| **Default ordering** | Per-sender FIFO guaranteed | Not guar
+          +anteed (FIFO with `max_concurrency=1` as side effect) |       
+      381 +| **Implementation** | Rust-level sequence numbers per sender 
+          +| Concurrency control at task level |                         
+      382 +| **Out-of-order opt-in** | Not available (ordering is fundame
+          +ntal) | `_ray_allow_out_of_order_execution = True` |          
+      383 +| **Multi-sender** | Each sender has independent ordering | No
+          + ordering guarantees across senders |                         
+      384 +| **Performance trade-off** | Ordered delivery may buffer mess
+          +ages | Opt-in unordering for throughput |                     
+      385 +                                                              
+      386 +---                                                           
+      387 +                                                              
+      388 +## 5. Supervision and Fault Tolerance                         
+      389 +                                                              
+      390 +> **Notebook ref**: [`notebooks/03_fault_tolerance.py`](../not
+          +ebooks/03_fault_tolerance.py) — supervision trees, `__supervis
+          +e__`, TorchFT integration.                                    
+      391 +                                                              
+      392 +### Monarch                                                   
+      393 +                                                              
+      394 +Monarch has an explicit **Erlang-style supervision tree**. Eve
+          +ry actor has a parent (the actor that called `spawn()`). When 
+          +a child crashes, `__supervise__` is called on the parent with 
+          +a `MeshFailure` describing what failed.                       
+      395 +                                                              
+      396 +```python                                                     
+      397 +# Monarch: Erlang-style supervision tree                      
+      398 +from monarch.actor import Actor, endpoint, MeshFailure        
+      399 +                                                              
+      400 +class Supervisor(Actor):                                      
+      401 +    def __supervise__(self, failure: MeshFailure):            
+      402 +        """Called when a child actor crashes."""              
+      403 +        print(f"Child failed: {failure}")                     
+      404 +        # Return True -> handled, stop propagation            
+      405 +        # Return False -> escalate to MY supervisor           
+      406 +        return True                                           
+      407 +                                                              
+      408 +    @endpoint                                                 
+      409 +    def spawn_worker(self) -> None:                           
+      410 +        worker = this_proc().spawn("worker", FlakyWorker)     
+      411 +        worker.do_work.broadcast()                            
+      412 +                                                              
+      413 +class FlakyWorker(Actor):                                     
+      414 +    @endpoint                                                 
+      415 +    def do_work(self):                                        
+      416 +        raise RuntimeError("GPU memory error!")               
+      417 +                                                              
+      418 +# Failure flow:                                               
+      419 +# 1. FlakyWorker.do_work raises RuntimeError                  
+      420 +# 2. Supervisor.__supervise__(MeshFailure) is called          
+      421 +# 3. Supervisor returns True -> failure handled               
+      422 +# 4. If Supervisor returned False -> propagate to Supervisor's
+          + parent                                                       
+      423 +# 5. If nobody handles it -> unhandled_fault_hook fires (defau
+          +lt: exit 1)                                                   
+      424 +```                                                           
+      425 +                                                              
+      426  The supervision tree composes with **TorchFT** for training-sp
+           ecific fault tolerance: quorum-based training continues with h
+           ealthy replicas while Monarch respawns crashed ones.
+      427  
+      158 -**Ray** has **no supervision tree**. Fault tolerance is flat a
+          -nd configuration-driven:                                      
+      428 +**Source links:**                                             
+      429 +- [`unhandled_fault_hook()`](https://github.com/pytorch/monarc
+          +h/blob/febefda69e1f9e9a696596b3de368ac557320b21/python/monarch
+          +/_src/actor/supervision.py#L17)                               
+      430 +- [`MeshFailure` type stubs](https://github.com/pytorch/monarc
+          +h/blob/febefda69e1f9e9a696596b3de368ac557320b21/python/monarch
+          +/_rust_bindings/monarch_hyperactor/supervision.pyi)           
+      431  
+      432 +### Ray                                                       
+      433 +                                                              
+      434 +Ray has **no supervision tree**. Fault tolerance is flat and c
+          +onfiguration-driven, managed by the GCS `GcsActorManager`:    
+      435 +                                                              
+      436  ```python
+      161 -# Ray: restart policy at actor creation (from actor.py:1394-14
+          -09)                                                           
+      437 +# Ray: flat restart policy per actor                          
+      438  @ray.remote(max_restarts=3, max_task_retries=5)
+      163 -class MyActor:                                                
+      164 -    pass                                                      
+      439 +class ResilientWorker:                                        
+      440 +    def __init__(self):                                       
+      441 +        self.state = self._load_checkpoint()                  
+      442  
+      166 -# Per-method override                                         
+      167 -@ray.method(max_task_retries=10)                              
+      168 -def fragile_method(self):                                     
+      169 -    pass                                                      
+      443 +    def do_work(self):                                        
+      444 +        # If this crashes, Ray restarts the actor (up to max_r
+          +estarts)                                                      
+      445 +        # In-flight tasks retry (up to max_task_retries)      
+      446 +        pass                                                  
+      447 +                                                              
+      448 +    @ray.method(max_task_retries=10)                          
+      449 +    def fragile_method(self):                                 
+      450 +        """Per-method retry override."""                      
+      451 +        pass                                                  
+      452 +                                                              
+      453 +# When an actor dies:                                         
+      454 +try:                                                          
+      455 +    ray.get(worker.do_work.remote())                          
+      456 +except ray.exceptions.RayActorError as e:                     
+      457 +    print(f"Actor died: {e}")                                 
+      458 +    # No parent notification, no structured propagation       
+      459 +    # Actor may have been restarted by GCS already            
+      460 +                                                              
+      461 +# Detached actors survive driver exit                         
+      462 +worker = ResilientWorker.options(                             
+      463 +    lifetime="detached", name="persistent_worker"             
+      464 +).remote()                                                    
+      465  ```
+      466  
+      172 -When an actor dies:                                           
+      173 -1. Ray checks `max_restarts`. If restarts remain, the GCS `Gcs
+          -ActorManager` reschedules the actor on a (possibly different) 
+          -node.                                                         
+      174 -2. In-flight tasks fail with `RayActorError`. Callers catch th
+          -is or it propagates as a Python exception.                    
+      175 -3. `max_task_retries` controls automatic retry of individual m
+          -ethod calls.                                                  
+      176 -4. **Detached actors** (`lifetime="detached"`) survive driver 
+          -exit and are tracked by GCS.                                  
+      177 -5. No parent notification, no structured propagation, no `__su
+          -pervise__`-style callback.                                    
+      467 +**Source links:**                                             
+      468 +- [`max_restarts`, `max_task_retries` options](https://github.
+          +com/ray-project/ray/blob/25da7108abbec7606e8e0ce057e3a5d224218
+          +50f/python/ray/actor.py#L1394-L1412)                          
+      469 +- [`RayActorError`](https://github.com/ray-project/ray/blob/25
+          +da7108abbec7606e8e0ce057e3a5d22421850f/python/ray/exceptions.p
+          +y#L332)                                                       
+      470 +- [`ActorDiedError`](https://github.com/ray-project/ray/blob/2
+          +5da7108abbec7606e8e0ce057e3a5d22421850f/python/ray/exceptions.
+          +py#L371)                                                      
+      471 +- [GCS `GcsActorManager`](https://github.com/ray-project/ray/b
+          +lob/25da7108abbec7606e8e0ce057e3a5d22421850f/src/ray/gcs/gcs_a
+          +ctor_manager.h#L93)                                           
+      472 +- [GCS actor restart logic](https://github.com/ray-project/ray
+          +/blob/25da7108abbec7606e8e0ce057e3a5d22421850f/src/ray/gcs/gcs
+          +_actor_manager.cc) (2032 lines)                               
+      473  
+      474 +### Comparison                                                
+      475 +                                                              
+      476  | Aspect | Monarch | Ray |
+      477  |--------|---------|-----|
+      478  | **Model** | Supervision tree (Erlang-style) | Flat restart p
+           olicy per actor |
+      182 -| **Failure notification** | `__supervise__(MeshFailure)` on p
+          -arent actor | `RayActorError` exception on caller |           
+      183 -| **Propagation** | Structured: up the tree, each level can ha
+          -ndle or escalate | Flat: exception to caller, no tree |       
+      479 +| **Failure notification** | `__supervise__(MeshFailure)` on p
+          +arent | `RayActorError` exception on caller |                 
+      480 +| **Propagation** | Structured: up the tree, each level handle
+          +s or escalates | Flat: exception to caller, no tree |         
+      481  | **Restart** | Parent decides (can respawn, log, ignore) | Au
+           tomatic by GCS up to `max_restarts` |
+      482  | **Per-method control** | No (supervision is at actor level) 
+           | Yes (`@ray.method(max_task_retries=N)`) |
+      186 -| **Quorum training** | Built-in via TorchFT integration | Not
+          - built-in (use external libraries) |                          
+      187 -| **Unhandled failures** | `unhandled_fault_hook` at client | 
+          -Actor marked as dead, `RayActorError` on future calls |       
+      483 +| **Quorum training** | Built-in via TorchFT integration | Not
+          + built-in (external libraries) |                              
+      484 +| **Unhandled failures** | `unhandled_fault_hook` at client | 
+          +Actor marked dead, `RayActorError` on future calls |          
+      485 +| **Detached actors** | N/A (single controller model) | `lifet
+          +ime="detached"` survives driver exit |                        
+      486  
+      487  ---
+      488  
+      191 -## 5. Data Plane: RDMA vs Object Store                        
+      489 +## 6. Data Plane — RDMA vs Object Store                       
+      490  
+      193 -This matters enormously for the async RL use case the Monarch 
+          -notebooks target.                                             
+      491 +> **Notebook refs**: [`notebooks/07_rdma_weight_sync.py`](../n
+          +otebooks/07_rdma_weight_sync.py), [`notebooks/07b_weight_sync_
+          +deep_dive.py`](../notebooks/07b_weight_sync_deep_dive.py) — RD
+          +MABuffer, magic pointer pattern, ibverbs deep dive.           
+      492  
+      195 -**Monarch** separates control plane from data plane explicitly
+          -:                                                             
+      493 +This matters enormously for async RL and any workload that mov
+          +es large tensors between actors.                              
+      494 +                                                              
+      495 +### Monarch                                                   
+      496 +                                                              
+      497 +Monarch separates control plane from data plane explicitly:   
+      498  - **Control plane**: actor endpoint messages (small, serialize
+           d Python objects)
+      197 -- **Data plane**: `RDMABuffer` — a ~150-byte handle that repre
+          -sents remote GPU/CPU memory. One-sided RDMA reads/writes bypas
+          -s the remote CPU entirely. The "magic pointer" pattern from NB
+          -07.                                                           
+      499 +- **Data plane**: `RDMABuffer` — a ~150-byte handle that repre
+          +sents remote GPU/CPU memory                                   
+      500  
+      501 +The key insight is the **"magic pointer" pattern**: you send a
+          + tiny handle (control plane) and the receiver does a one-sided
+          + RDMA read to pull the bulk data (data plane). The remote CPU 
+          +is not involved in the transfer.                              
+      502 +                                                              
+      503  ```python
+      200 -# Monarch: zero-copy weight transfer                          
+      201 -buffer = RDMABuffer(weights.view(torch.uint8))     # register 
+          -once                                                          
+      202 -handle = trainer.get_weight_handle.call_one().get() # ~150 byt
+          -es                                                            
+      203 -handle.read_into(local_weights).get()               # bulk RDM
+          -A, no trainer involvement                                     
+      504 +# Monarch: zero-copy weight transfer via RDMA                 
+      505 +from monarch.rdma import RDMABuffer                           
+      506 +                                                              
+      507 +# Trainer side: register weights as RDMA buffer               
+      508 +class Trainer(Actor):                                         
+      509 +    @endpoint                                                 
+      510 +    def get_weight_handle(self) -> RDMABuffer:                
+      511 +        # ~150-byte handle — just metadata, no data copy      
+      512 +        return RDMABuffer(self.model.state_dict_tensors().view
+          +(torch.uint8))                                                
+      513 +                                                              
+      514 +# Inference side: pull weights when ready                     
+      515 +class Inference(Actor):                                       
+      516 +    @endpoint                                                 
+      517 +    async def sync_weights(self, trainer_handle: RDMABuffer) -
+          +> None:                                                       
+      518 +        # One-sided RDMA read: pulls directly from trainer's G
+          +PU memory                                                     
+      519 +        # Trainer CPU is NOT involved — no interruption to tra
+          +ining                                                         
+      520 +        await trainer_handle.read_into(self.local_weight_buffe
+          +r)                                                            
+      521 +        self.model.load_state_dict(self.local_weight_buffer)  
+      522 +                                                              
+      523 +# Orchestration                                               
+      524 +handle = trainer.get_weight_handle.call_one().get()  # ~150 by
+          +tes via control plane                                         
+      525 +inference.sync_weights.broadcast(handle)              # RDMA p
+          +ull via data plane                                            
+      526  ```
+      527  
+      206 -**Ray** uses the **Plasma object store** (shared memory) for i
+          -ntra-node data sharing, and gRPC + object transfer for cross-n
+          -ode. For GPU collectives, there's `ray.util.collective` (`pyth
+          -on/ray/util/collective/collective.py`) wrapping NCCL and Gloo 
+          -— but these are **collective** (two-sided, blocking) rather th
+          -an one-sided RDMA. Ray also has an experimental `tensor_transp
+          -ort` mechanism (`actor_handle.h:52`, `actor.py:1921`) for NCCL
+          -/Gloo-backed method returns, but it's opt-in and method-level.
+      528 +Under the hood, `RDMABuffer` uses InfiniBand verbs (ibverbs) f
+          +or true one-sided RDMA — the `RdmaController` actor manages qu
+          +eue pairs and memory registration.                            
+      529  
+      530 +**Source links:**                                             
+      531 +- [`RDMABuffer`](https://github.com/pytorch/monarch/blob/febef
+          +da69e1f9e9a696596b3de368ac557320b21/python/monarch/_src/rdma/r
+          +dma.py#L210)                                                  
+      532 +- [`RDMABuffer.read_into()`](https://github.com/pytorch/monarc
+          +h/blob/febefda69e1f9e9a696596b3de368ac557320b21/python/monarch
+          +/_src/rdma/rdma.py#L263)                                      
+      533 +- [`RdmaController` actor](https://github.com/pytorch/monarch/
+          +blob/febefda69e1f9e9a696596b3de368ac557320b21/python/monarch/_
+          +src/rdma/rdma.py#L122)                                        
+      534 +- [Rust RDMA manager actor](https://github.com/pytorch/monarch
+          +/blob/febefda69e1f9e9a696596b3de368ac557320b21/monarch_rdma/sr
+          +c/rdma_manager_actor.rs)                                      
+      535 +- [Rust `RdmaBuffer`, `QueuePair`](https://github.com/pytorch/
+          +monarch/blob/febefda69e1f9e9a696596b3de368ac557320b21/monarch_
+          +rdma/src/rdma_components.rs)                                  
+      536 +- [InfiniBand verbs primitives](https://github.com/pytorch/mon
+          +arch/blob/febefda69e1f9e9a696596b3de368ac557320b21/monarch_rdm
+          +a/src/ibverbs_primitives.rs)                                  
+      537 +                                                              
+      538 +### Ray                                                       
+      539 +                                                              
+      540 +Ray uses the **Plasma object store** (shared memory) for intra
+          +-node data sharing, and gRPC + object transfer for cross-node.
+          + For GPU collectives, `ray.util.collective` wraps NCCL and Glo
+          +o — but these are **collective** (two-sided, blocking) rather 
+          +than one-sided RDMA.                                          
+      541 +                                                              
+      542 +```python                                                     
+      543 +# Ray: weight transfer via object store                       
+      544 +import ray                                                    
+      545 +                                                              
+      546 +@ray.remote(num_gpus=1)                                       
+      547 +class Trainer:                                                
+      548 +    def get_weights(self) -> dict:                            
+      549 +        # Serializes entire state dict through Plasma object s
+          +tore                                                          
+      550 +        return self.model.state_dict()                        
+      551 +                                                              
+      552 +@ray.remote(num_gpus=1)                                       
+      553 +class Inference:                                              
+      554 +    def load_weights(self, weights: dict) -> None:            
+      555 +        # Deserialized from object store — full copy          
+      556 +        self.model.load_state_dict(weights)                   
+      557 +                                                              
+      558 +# Transfer: goes through Plasma object store                  
+      559 +weights_ref = trainer.get_weights.remote()                    
+      560 +ray.get(inference.load_weights.remote(weights_ref))           
+      561 +                                                              
+      562 +# Alternative: NCCL collectives (two-sided, blocking)         
+      563 +from ray.util.collective import allreduce                     
+      564 +# Requires all participants to call collectively              
+      565 +```                                                           
+      566 +                                                              
+      567 +Ray also has an experimental `tensor_transport` mechanism for 
+          +NCCL/Gloo-backed method returns, but it's opt-in and method-le
+          +vel.                                                          
+      568 +                                                              
+      569 +**Source links:**                                             
+      570 +- [`GroupManager`](https://github.com/ray-project/ray/blob/25d
+          +a7108abbec7606e8e0ce057e3a5d22421850f/python/ray/util/collecti
+          +ve/collective.py#L71) — collective group management           
+      571 +- [NCCL collective group](https://github.com/ray-project/ray/b
+          +lob/25da7108abbec7606e8e0ce057e3a5d22421850f/python/ray/util/c
+          +ollective/collective_group/nccl_collective_group.py)          
+      572 +- [Tensor transport per-method config](https://github.com/ray-
+          +project/ray/blob/25da7108abbec7606e8e0ce057e3a5d22421850f/pyth
+          +on/ray/actor.py#L1921)                                        
+      573 +- [C++ CoreWorker (object transfer)](https://github.com/ray-pr
+          +oject/ray/blob/25da7108abbec7606e8e0ce057e3a5d22421850f/src/ra
+          +y/core_worker/core_worker.h)                                  
+      574 +                                                              
+      575 +### Comparison                                                
+      576 +                                                              
+      577  | Aspect | Monarch | Ray |
+      578  |--------|---------|-----|
+      579  | **Intra-node** | Shared process mesh, direct memory access |
+            Plasma object store (shared memory) |
+      580  | **Cross-node bulk** | One-sided RDMA (`RDMABuffer.read_into`
+           ) | gRPC object transfer, or NCCL collectives |
+      581  | **GPU-GPU** | RDMA (bypasses CPU on remote side) | NCCL via 
+           `ray.util.collective` (two-sided) |
+      582  | **Weight sync pattern** | Handle message (control) + RDMA pu
+           ll (data) | `ray.get(ref)` fetches through object store |
+      214 -| **Blocking** | One-sided: receiver pulls when ready, sender 
+          -uninvolved | Two-sided: collective requires all participants |
+      583 +| **Blocking** | One-sided: receiver pulls when ready | Two-si
+          +ded: collective requires all participants |                   
+      584 +| **Handle size** | ~150 bytes (just metadata) | Full serializ
+          +ed object in Plasma |                                         
+      585 +| **Training interruption** | None — trainer CPU not involved 
+          +in RDMA read | Trainer must serialize and send weights |      
+      586  
+      587  ---
+      588  
+      218 -## 6. Summary: Design Philosophy                              
+      589 +## 7. Distributed Tensors and Training                        
+      590  
+      220 -**Monarch** is a **structured, topology-aware actor system** b
+          -uilt for the specific reality of large-scale GPU training. You
+          - explicitly build mesh topologies, spawn actors with awareness
+          - of their position, and get automatic tree-routing and supervi
+          -sion. The Erlang heritage is clear: message ordering guarantee
+          -s, supervision trees, single-controller orchestration. The tra
+          -de-off is that you manage topology yourself.                  
+      591 +> **Notebook ref**: [`notebooks/04_distributed_tensors.py`](..
+          +/notebooks/04_distributed_tensors.py) — `DeviceMesh.activate()
+          +`, distributed tensor ops, `reduce()`, `inspect()`.           
+      592  
+      222 -**Ray** is a **general-purpose distributed computing framework
+          -** with a flat actor model layered on top of a sophisticated d
+          -istributed object store. Scheduling is automatic, the programm
+          -ing model is simpler (just `@ray.remote` and `.remote()`), and
+          - it serves a broader range of workloads (ML training, serving,
+          - data processing, simulations). The trade-off is that you lose
+          - structured messaging, mesh-aware collectives, supervision tre
+          -es, and native RDMA — you build these patterns yourself or use
+          - higher-level libraries (Ray Train, Ray Serve).               
+      593 +### Monarch                                                   
+      594  
+      224 -The core tension: **Monarch gives you structured primitives th
+          -at compose** (meshes, tree-routing, supervision, RDMA handles)
+          - at the cost of explicitness. **Ray gives you simplicity and g
+          -enerality** at the cost of leaving structure to the applicatio
+          -n layer.                                                      
+      595 +Monarch provides **first-class distributed tensors**. When a `
+          +DeviceMesh` is activated, standard PyTorch operations automati
+          +cally execute across all devices in the mesh. The controller s
+          +ees a single logical tensor; the runtime manages distribution.
+      596  
+      597 +```python                                                     
+      598 +# Monarch: distributed tensors with mesh activation           
+      599 +import torch                                                  
+      600 +from monarch.actor import this_host                           
+      601 +from monarch.common.device_mesh import DeviceMesh             
+      602 +from monarch.fetch import inspect                             
+      603 +                                                              
+      604 +# Create mesh and activate it                                 
+      605 +mesh = this_host().spawn_procs({"gpu": 8})                    
+      606 +                                                              
+      607 +with mesh.activate():                                         
+      608 +    # Standard PyTorch — but runs on all 8 GPUs               
+      609 +    t = torch.rand(3, 4, device="cuda")                       
+      610 +                                                              
+      611 +    # Each GPU has its own copy — reduce across a dimension   
+      612 +    t.reduce("gpu", reduction="avg")                          
+      613 +                                                              
+      614 +    # Inspect: fetch from a specific device to the controller 
+      615 +    local_copy = inspect(t, gpu=0)  # brings GPU 0's tensor to
+          + controller                                                   
+      616 +    print(local_copy.shape)  # torch.Size([3, 4])             
+      617 +                                                              
+      618 +# Multi-dimensional meshes for parallelism strategies         
+      619 +mesh_2d = DeviceMesh(hosts=4, gpus_per_host=8, dims=("dp", "tp
+          +"))                                                           
+      620 +with mesh_2d.activate():                                      
+      621 +    loss = model(X)                                           
+      622 +    loss.backward()                                           
+      623 +    # All-reduce gradients across data-parallel dimension only
+      624 +    for p in model.parameters():                              
+      625 +        p.grad.reduce_("dp", reduction="avg")                 
+      626 +    optimizer.step()                                          
+      627 +```                                                           
+      628 +                                                              
+      629 +**Source links:**                                             
+      630 +- [`Tensor` (distributed)](https://github.com/pytorch/monarch/
+          +blob/febefda69e1f9e9a696596b3de368ac557320b21/python/monarch/c
+          +ommon/tensor.py#L78)                                          
+      631 +- [`DeviceMesh`](https://github.com/pytorch/monarch/blob/febef
+          +da69e1f9e9a696596b3de368ac557320b21/python/monarch/common/devi
+          +ce_mesh.py#L154)                                              
+      632 +- [`DeviceMesh.activate()`](https://github.com/pytorch/monarch
+          +/blob/febefda69e1f9e9a696596b3de368ac557320b21/python/monarch/
+          +common/device_mesh.py#L310)                                   
+      633 +- [`reduce()`](https://github.com/pytorch/monarch/blob/febefda
+          +69e1f9e9a696596b3de368ac557320b21/python/monarch/common/tensor
+          +.py#L792)                                                     
+      634 +- [`inspect()`](https://github.com/pytorch/monarch/blob/febefd
+          +a69e1f9e9a696596b3de368ac557320b21/python/monarch/fetch.py#L50
+          +)                                                             
+      635 +- [NCCL collective comms (Rust)](https://github.com/pytorch/mo
+          +narch/blob/febefda69e1f9e9a696596b3de368ac557320b21/monarch_te
+          +nsor_worker/src/comm.rs)                                      
+      636 +                                                              
+      637 +### Ray                                                       
+      638 +                                                              
+      639 +Ray provides **no first-class distributed tensor**. Instead, R
+          +ay Train wraps PyTorch's `DistributedDataParallel` (DDP) or FS
+          +DP, managing the distributed setup but leaving tensor operatio
+          +ns to PyTorch:                                                
+      640 +                                                              
+      641 +```python                                                     
+      642 +# Ray Train: wraps PyTorch DDP                                
+      643 +from ray.train.torch import TorchTrainer                      
+      644 +from ray.train import ScalingConfig                           
+      645 +import ray.train.torch                                        
+      646 +                                                              
+      647 +def train_func():                                             
+      648 +    # Ray sets up the distributed environment                 
+      649 +    model = build_model()                                     
+      650 +    model = ray.train.torch.prepare_model(model)  # wraps in D
+          +DP                                                            
+      651 +                                                              
+      652 +    dataset = ray.train.get_dataset_shard("train")            
+      653 +    for batch in dataset.iter_torch_batches():                
+      654 +        loss = model(batch)                                   
+      655 +        loss.backward()  # DDP handles gradient sync          
+      656 +        optimizer.step()                                      
+      657 +        ray.train.report({"loss": loss.item()})               
+      658 +                                                              
+      659 +trainer = TorchTrainer(                                       
+      660 +    train_func,                                               
+      661 +    scaling_config=ScalingConfig(num_workers=8, use_gpu=True),
+      662 +)                                                             
+      663 +result = trainer.fit()                                        
+      664 +```                                                           
+      665 +                                                              
+      666 +**Source links:**                                             
+      667 +- [`TorchTrainer`](https://github.com/ray-project/ray/blob/25d
+          +a7108abbec7606e8e0ce057e3a5d22421850f/python/ray/train/torch/t
+          +orch_trainer.py#L11)                                          
+      668 +- [`TrainingIterator`](https://github.com/ray-project/ray/blob
+          +/25da7108abbec7606e8e0ce057e3a5d22421850f/python/ray/train/tra
+          +iner.py#L36)                                                  
+      669 +                                                              
+      670 +### Comparison                                                
+      671 +                                                              
+      672 +| Aspect | Monarch | Ray |                                    
+      673 +|--------|---------|-----|                                    
+      674 +| **Distributed tensor** | First-class: `mesh.activate()`, sta
+          +ndard PyTorch ops distributed | No — wraps DDP/FSDP via Ray Tr
+          +ain |                                                         
+      675 +| **Programming model** | Single controller writes normal PyTo
+          +rch; runtime distributes | Training function runs on each work
+          +er (SPMD) |                                                   
+      676 +| **Collective ops** | `tensor.reduce("dim", reduction="avg")`
+          + — mesh-dimension-aware | PyTorch DDP handles gradient sync au
+          +tomatically |                                                 
+      677 +| **Mesh dimensions** | Named: `"dp"`, `"tp"`, `"pp"` — reduce
+          +/broadcast by name | N/A — DDP uses process groups |          
+      678 +| **Inspect/fetch** | `inspect(t, gpu=0)` — bring remote tenso
+          +r to controller | Manual: `ray.get()` or `ray.train.report()` 
+          +|                                                             
+      679 +| **Parallelism strategies** | Compose via mesh dimensions (DP
+          + + TP + PP) | Configure via Ray Train (DDP, FSDP, DeepSpeed) |
+      680 +                                                              
+      681  ---
+      682  
+      228 -## Source Files Referenced                                    
+      683 +## 8. Interactive DevX (Single Controller)                    
+      684  
+      230 -### Monarch (this repo)                                       
+      231 -- `notebooks/01_history_and_vision.py` — Actor model, PingPong
+          -, meshes                                                      
+      232 -- `notebooks/03_fault_tolerance.py` — Supervision trees, `__su
+          -pervise__`, TorchFT                                           
+      233 -- `notebooks/04_distributed_tensors.py` — Mesh reshape, collec
+          -tives, pipelining                                             
+      234 -- `notebooks/06_services.py` — Service actor, ServiceRegistry 
+      235 -- `notebooks/07_rdma_weight_sync.py` — RDMABuffer, magic point
+          -er pattern                                                    
+      236 -- `notebooks/07b_weight_sync_deep_dive.py` — ibverbs, RdmaCont
+          -roller as actor                                               
+      685 +> **Notebook ref**: [`notebooks/02_interactive_devx.py`](../no
+          +tebooks/02_interactive_devx.py) — SPMD actors, `serve()`, inte
+          +ractive endpoint calls from notebook.                         
+      686  
+      238 -### Ray (`/home/phi9t/workspace/ray`)                         
+      239 -- `python/ray/actor.py` — `ActorClass`, `ActorHandle`, `max_re
+          -starts`, `max_task_retries`                                   
+      240 -- `src/ray/core_worker/actor_handle.h` — C++ `ActorHandle` wit
+          -h owner tracking                                              
+      241 -- `src/ray/core_worker/core_worker.h` — Per-process runtime   
+      242 -- `src/ray/gcs/gcs_server.h` — Global Control Store           
+      243 -- `src/ray/raylet/node_manager.h` — Per-node Raylet           
+      244 -- `python/ray/util/placement_group.py` — Placement groups     
+      245 -- `python/ray/util/collective/collective.py` — NCCL/Gloo colle
+          -ctives                                                        
+      687 +### Monarch                                                   
+      688 +                                                              
+      689 +Monarch's **single-controller paradigm** is designed for inter
+          +active development. One Python process (a notebook or script) 
+          +orchestrates all distributed actors. The `SPMDActor` pattern l
+          +ets you write SPMD-style code that's controlled from a single 
+          +interactive session:                                          
+      690 +                                                              
+      691 +```python                                                     
+      692 +# Monarch: interactive single-controller development          
+      693 +from monarch._src.spmd.actor import SPMDActor                 
+      694 +from monarch._src.job.spmd import serve                       
+      695 +from monarch.actor import Actor, endpoint, this_host          
+      696 +                                                              
+      697 +# Define an actor — same as always                            
+      698 +class Researcher(Actor):                                      
+      699 +    @endpoint                                                 
+      700 +    def train_step(self, lr: float) -> dict:                  
+      701 +        # ... training logic ...                              
+      702 +        return {"loss": 0.42, "step": self.step}              
+      703 +                                                              
+      704 +    @endpoint                                                 
+      705 +    def get_state(self) -> dict:                              
+      706 +        return {"weights_hash": hash(self.weights), "steps": s
+          +elf.step}                                                     
+      707 +                                                              
+      708 +# In a notebook cell: spawn and interact                      
+      709 +host = this_host()                                            
+      710 +procs = host.spawn_procs(per_host={"gpus": 4})                
+      711 +researchers = procs.spawn("researchers", Researcher)          
+      712 +                                                              
+      713 +# Interactive: call endpoints, inspect results, iterate       
+      714 +result = researchers.train_step.call(lr=1e-4).get()           
+      715 +print(result)  # see all 4 GPUs' results immediately          
+      716 +                                                              
+      717 +state = researchers.get_state.call().get()                    
+      718 +print(state)  # inspect distributed state interactively       
+      719 +                                                              
+      720 +# Change hyperparameters on the fly — no restart needed       
+      721 +result2 = researchers.train_step.call(lr=5e-5).get()          
+      722 +```                                                           
+      723 +                                                              
+      724 +The key insight: **the notebook IS the controller**. You don't
+          + submit jobs — you interactively drive distributed computation
+          + from your development environment.                           
+      725 +                                                              
+      726 +**Source links:**                                             
+      727 +- [`SPMDActor`](https://github.com/pytorch/monarch/blob/febefd
+          +a69e1f9e9a696596b3de368ac557320b21/python/monarch/_src/spmd/ac
+          +tor.py#L29)                                                   
+      728 +- [`serve()` function](https://github.com/pytorch/monarch/blob
+          +/febefda69e1f9e9a696596b3de368ac557320b21/python/monarch/_src/
+          +job/spmd.py#L149)                                             
+      729 +                                                              
+      730 +### Ray                                                       
+      731 +                                                              
+      732 +Ray uses a **job submission model**. You write a training scri
+          +pt, submit it to a Ray cluster, and monitor it externally. Int
+          +eractive development is possible via `ray.init()` in a noteboo
+          +k, but the programming model is still "submit remote tasks":  
+      733 +                                                              
+      734 +```python                                                     
+      735 +# Ray: job submission model                                   
+      736 +import ray                                                    
+      737 +                                                              
+      738 +ray.init()  # connect to cluster (or start local)             
+      739 +                                                              
+      740 +@ray.remote(num_gpus=1)                                       
+      741 +class Trainer:                                                
+      742 +    def train_step(self, lr: float) -> dict:                  
+      743 +        return {"loss": 0.42}                                 
+      744 +                                                              
+      745 +# Create actors — but each is an independent remote process   
+      746 +trainers = [Trainer.remote() for _ in range(4)]               
+      747 +                                                              
+      748 +# Call: fan-out + gather pattern                              
+      749 +refs = [t.train_step.remote(lr=1e-4) for t in trainers]       
+      750 +results = ray.get(refs)                                       
+      751 +                                                              
+      752 +# To change something: call new methods on existing handles   
+      753 +refs2 = [t.train_step.remote(lr=5e-5) for t in trainers]      
+      754 +results2 = ray.get(refs2)                                     
+      755 +                                                              
+      756 +# For production: Ray Jobs CLI                                
+      757 +# $ ray job submit --working-dir . -- python train.py         
+      758 +# $ ray job status <job_id>                                   
+      759 +# $ ray job logs <job_id>                                     
+      760 +```                                                           
+      761 +                                                              
+      762 +Ray also has **Ray Serve** for deploying models as HTTP endpoi
+          +nts, which is a different paradigm from Monarch's single-contr
+          +oller approach.                                               
+      763 +                                                              
+      764 +### Comparison                                                
+      765 +                                                              
+      766 +| Aspect | Monarch | Ray |                                    
+      767 +|--------|---------|-----|                                    
+      768 +| **Development model** | Notebook IS the controller (single c
+          +ontroller) | Submit jobs to cluster; notebook as client |     
+      769 +| **Interaction** | Direct: `actors.method.call().get()` in no
+          +tebook cell | Remote: `.remote()` + `ray.get()` |             
+      770 +| **State inspection** | `inspect(tensor, gpu=0)` — pull any d
+          +istributed state | `ray.get(actor.get_state.remote())` |      
+      771 +| **Hyperparameter changes** | Instant: next `call()` uses new
+          + params | Same: next `.remote()` uses new params |            
+      772 +| **Production deployment** | Same code runs in notebook and p
+          +roduction | Ray Jobs CLI, Ray Serve for serving |             
+      773 +| **SPMD support** | Native `SPMDActor`, `serve()` | Ray Train
+          + wraps DDP/FSDP |                                             
+      774 +| **Restart on code change** | Hot-reload: respawn actors on m
+          +esh | Restart workers or resubmit job |                       
+      775 +                                                              
+      776 +---                                                           
+      777 +                                                              
+      778 +## 9. Design Philosophy Summary                               
+      779 +                                                              
+      780 +The comparison reveals a fundamental tension between two desig
+          +n philosophies:                                               
+      781 +                                                              
+      782 +### Monarch: Structured Topology-Aware Primitives             
+      783 +                                                              
+      784 +Monarch is a **structured, topology-aware actor system** built
+          + for the specific reality of large-scale GPU training. You exp
+          +licitly build mesh topologies, spawn actors with awareness of 
+          +their position, and get automatic tree-routing and supervision
+          +. The Erlang heritage is clear: message ordering guarantees, s
+          +upervision trees, single-controller orchestration.            
+      785 +                                                              
+      786 +**Core bet**: At GPU-training scale (thousands of GPUs, failur
+          +es every 3 hours), you need structured primitives that compose
+          + — meshes, tree-routing, supervision, RDMA handles. The cost o
+          +f managing topology explicitly is repaid by the runtime's abil
+          +ity to route efficiently, handle failures systematically, and 
+          +separate control plane from data plane.                       
+      787 +                                                              
+      788 +```                                                           
+      789 +Monarch: structured topology → efficient routing → systematic 
+          +fault handling                                                
+      790 +         ┌────────────────────────────────────────────────────
+          +─────┐                                                        
+      791 +         │  Controller (notebook/script)                      
+          +     │                                                        
+      792 +         │    ↓ spawn_procs()     ↓ spawn()     ↓ call()      
+          +    │                                                         
+      793 +         │  ┌─────────────┐    ┌──────────┐   ┌───────────────
+          +─┐  │                                                         
+      794 +         │  │  ProcMesh   │ →  │ActorMesh │ → │ Tree broadcast
+          + │  │                                                         
+      795 +         │  │ {dp:4,tp:8} │    │ sliceable│   │ O(log N)      
+          + │  │                                                         
+      796 +         │  └─────────────┘    └──────────┘   └───────────────
+          +─┘  │                                                         
+      797 +         │                                                    
+          +     │                                                        
+      798 +         │  Supervision: parent → __supervise__ → handle/escal
+          +ate  │                                                        
+      799 +         │  Data plane:  RDMABuffer → one-sided read (bypass C
+          +PU)  │                                                        
+      800 +         └────────────────────────────────────────────────────
+          +─────┘                                                        
+      801 +```                                                           
+      802 +                                                              
+      803 +### Ray: General-Purpose Simplicity                           
+      804 +                                                              
+      805 +Ray is a **general-purpose distributed computing framework** w
+          +ith a flat actor model layered on top of a sophisticated distr
+          +ibuted object store. Scheduling is automatic, the programming 
+          +model is simpler (just `@ray.remote` and `.remote()`), and it 
+          +serves a broader range of workloads (ML training, serving, dat
+          +a processing, simulations).                                   
+      806 +                                                              
+      807 +**Core bet**: A simple, general-purpose abstraction (remote fu
+          +nctions + actors + object store) is more valuable than special
+          +ized primitives, because higher-level patterns can be built on
+          + top (Ray Train, Ray Serve, Ray Data). The ecosystem wins over
+          + built-in structure.                                          
+      808 +                                                              
+      809 +```                                                           
+      810 +Ray: simple abstraction → broad applicability → rich ecosystem
+      811 +     ┌────────────────────────────────────────────────────────
+          +──┐                                                           
+      812 +     │  Driver (script/notebook)                              
+          +  │                                                           
+      813 +     │    ↓ @ray.remote         ↓ .remote()    ↓ ray.get()    
+          + │                                                            
+      814 +     │  ┌─────────────────┐  ┌────────────┐  ┌──────────────┐ 
+          + │                                                            
+      815 +     │  │  GCS + Raylet   │  │ ObjectRef  │  │ Plasma store │ 
+          + │                                                            
+      816 +     │  │  auto-schedule  │  │ ownership  │  │ shared mem   │ 
+          + │                                                            
+      817 +     │  └─────────────────┘  └────────────┘  └──────────────┘ 
+          + │                                                            
+      818 +     │                                                        
+          +  │                                                           
+      819 +     │  Fault tolerance: max_restarts + max_task_retries (flat
+          +) │                                                           
+      820 +     │  Data plane: Plasma object store + optional NCCL       
+          +  │                                                           
+      821 +     └────────────────────────────────────────────────────────
+          +──┘                                                           
+      822 +```                                                           
+      823 +                                                              
+      824 +### When to Choose Each                                       
+      825 +                                                              
+      826 +| Criteria | Monarch | Ray |                                  
+      827 +|----------|---------|-----|                                  
+      828 +| **GPU training at scale** (1000+ GPUs) | Strong fit — meshes
+          +, RDMA, supervision | Possible via Ray Train, but less native 
+          +|                                                             
+      829 +| **Async RL** (training + inference overlap) | Purpose-built 
+          +— RDMA weight sync, actor separation | Possible but requires m
+          +anual coordination |                                          
+      830 +| **General distributed computing** | Can work, but mesh topol
+          +ogy may be overkill | Strong fit — simple API, broad ecosystem
+          + |                                                            
+      831 +| **ML serving** | Not the primary focus | Ray Serve is mature
+          + and production-ready |                                       
+      832 +| **Data processing pipelines** | Not designed for this | Ray 
+          +Data handles this well |                                      
+      833 +| **Fault tolerance requirements** | Supervision trees for sys
+          +tematic handling | Flat restart policies for simple cases |   
+      834 +| **Interactive development** | Single controller in notebook 
+          +— first-class | `ray.init()` in notebook — works but less nati
+          +ve |                                                          
+      835 +| **Team familiarity** | Requires learning mesh/actor concepts
+          + | `@ray.remote` is very approachable |                       
+      836 +                                                              
+      837 +---                                                           
+      838 +                                                              
+      839 +## Source Reference Index                                     
+      840 +                                                              
+      841 +### Monarch Sources (pytorch/monarch @ `febefda`)             
+      842 +                                                              
+      843 +| File | Key Items |                                          
+      844 +|------|-----------|                                          
+      845 +| [`python/monarch/_src/actor/actor_mesh.py`](https://github.c
+          +om/pytorch/monarch/blob/febefda69e1f9e9a696596b3de368ac557320b
+          +21/python/monarch/_src/actor/actor_mesh.py) | `Actor` (L1569),
+          + `ActorMesh` (L1606) |                                        
+      846 +| [`python/monarch/_src/actor/endpoint.py`](https://github.com
+          +/pytorch/monarch/blob/febefda69e1f9e9a696596b3de368ac557320b21
+          +/python/monarch/_src/actor/endpoint.py) | `@endpoint` (L509), 
+          +`call_one` (L241), `call` (L268), `stream` (L305), `broadcast`
+          + (L343) |                                                     
+      847 +| [`python/monarch/_src/actor/proc_mesh.py`](https://github.co
+          +m/pytorch/monarch/blob/febefda69e1f9e9a696596b3de368ac557320b2
+          +1/python/monarch/_src/actor/proc_mesh.py) | `ProcMesh` (L234) 
+          +|                                                             
+      848 +| [`python/monarch/_src/actor/host_mesh.py`](https://github.co
+          +m/pytorch/monarch/blob/febefda69e1f9e9a696596b3de368ac557320b2
+          +1/python/monarch/_src/actor/host_mesh.py) | `this_host()` (L48
+          +), `spawn_procs()` (L145) |                                   
+      849 +| [`python/monarch/_src/actor/supervision.py`](https://github.
+          +com/pytorch/monarch/blob/febefda69e1f9e9a696596b3de368ac557320
+          +b21/python/monarch/_src/actor/supervision.py) | `unhandled_fau
+          +lt_hook()` (L17) |                                            
+      850 +| [`python/monarch/_src/rdma/rdma.py`](https://github.com/pyto
+          +rch/monarch/blob/febefda69e1f9e9a696596b3de368ac557320b21/pyth
+          +on/monarch/_src/rdma/rdma.py) | `RDMABuffer` (L210), `read_int
+          +o()` (L263), `RdmaController` (L122) |                        
+      851 +| [`python/monarch/_src/spmd/actor.py`](https://github.com/pyt
+          +orch/monarch/blob/febefda69e1f9e9a696596b3de368ac557320b21/pyt
+          +hon/monarch/_src/spmd/actor.py) | `SPMDActor` (L29) |         
+      852 +| [`python/monarch/common/tensor.py`](https://github.com/pytor
+          +ch/monarch/blob/febefda69e1f9e9a696596b3de368ac557320b21/pytho
+          +n/monarch/common/tensor.py) | `Tensor` (L78), `reduce()` (L792
+          +) |                                                           
+      853 +| [`python/monarch/common/device_mesh.py`](https://github.com/
+          +pytorch/monarch/blob/febefda69e1f9e9a696596b3de368ac557320b21/
+          +python/monarch/common/device_mesh.py) | `DeviceMesh` (L154), `
+          +activate()` (L310) |                                          
+      854 +| [`hyperactor/src/mailbox.rs`](https://github.com/pytorch/mon
+          +arch/blob/febefda69e1f9e9a696596b3de368ac557320b21/hyperactor/
+          +src/mailbox.rs) | Rust mailbox engine (3977 lines) |          
+      855 +| [`hyperactor/src/ordering.rs`](https://github.com/pytorch/mo
+          +narch/blob/febefda69e1f9e9a696596b3de368ac557320b21/hyperactor
+          +/src/ordering.rs) | `BufferState`, `OrderedSender` (L25-50) | 
+      856 +| [`hyperactor_mesh/src/proc_mesh.rs`](https://github.com/pyto
+          +rch/monarch/blob/febefda69e1f9e9a696596b3de368ac557320b21/hype
+          +ractor_mesh/src/proc_mesh.rs) | Rust ProcMesh |               
+      857 +| [`hyperactor_mesh/src/actor_mesh.rs`](https://github.com/pyt
+          +orch/monarch/blob/febefda69e1f9e9a696596b3de368ac557320b21/hyp
+          +eractor_mesh/src/actor_mesh.rs) | Rust ActorMesh |            
+      858 +| [`hyperactor_mesh/src/comm/multicast.rs`](https://github.com
+          +/pytorch/monarch/blob/febefda69e1f9e9a696596b3de368ac557320b21
+          +/hyperactor_mesh/src/comm/multicast.rs) | Tree-based broadcast
+          + |                                                            
+      859 +| [`monarch_rdma/src/rdma_manager_actor.rs`](https://github.co
+          +m/pytorch/monarch/blob/febefda69e1f9e9a696596b3de368ac557320b2
+          +1/monarch_rdma/src/rdma_manager_actor.rs) | Rust RDMA manager 
+          +|                                                             
+      860 +| [`monarch_rdma/src/rdma_components.rs`](https://github.com/p
+          +ytorch/monarch/blob/febefda69e1f9e9a696596b3de368ac557320b21/m
+          +onarch_rdma/src/rdma_components.rs) | `RdmaBuffer`, `QueuePair
+          +` |                                                           
+      861 +| [`monarch_rdma/src/ibverbs_primitives.rs`](https://github.co
+          +m/pytorch/monarch/blob/febefda69e1f9e9a696596b3de368ac557320b2
+          +1/monarch_rdma/src/ibverbs_primitives.rs) | InfiniBand verbs |
+      862 +| [`monarch_tensor_worker/src/comm.rs`](https://github.com/pyt
+          +orch/monarch/blob/febefda69e1f9e9a696596b3de368ac557320b21/mon
+          +arch_tensor_worker/src/comm.rs) | NCCL collective comms |     
+      863 +                                                              
+      864 +### Ray Sources (ray-project/ray @ `25da710`)                 
+      865 +                                                              
+      866 +| File | Key Items |                                          
+      867 +|------|-----------|                                          
+      868 +| [`python/ray/actor.py`](https://github.com/ray-project/ray/b
+          +lob/25da7108abbec7606e8e0ce057e3a5d22421850f/python/ray/actor.
+          +py) | `ActorClass` (L1201), `remote()` (L1356), `ActorHandle` 
+          +(L1886), `_remote()` (L1511), `ActorMethod._remote()` (L802), 
+          +`max_restarts` (L1394), `tensor_transport` (L1921), `_ray_allo
+          +w_out_of_order_execution` (L1937) |                           
+      869 +| [`python/ray/exceptions.py`](https://github.com/ray-project/
+          +ray/blob/25da7108abbec7606e8e0ce057e3a5d22421850f/python/ray/e
+          +xceptions.py) | `RayActorError` (L332), `ActorDiedError` (L371
+          +) |                                                           
+      870 +| [`python/ray/_private/worker.py`](https://github.com/ray-pro
+          +ject/ray/blob/25da7108abbec7606e8e0ce057e3a5d22421850f/python/
+          +ray/_private/worker.py) | `ray.get()` (L2858), `ray.wait()` (L
+          +3074) |                                                       
+      871 +| [`python/ray/includes/object_ref.pxi`](https://github.com/ra
+          +y-project/ray/blob/25da7108abbec7606e8e0ce057e3a5d22421850f/py
+          +thon/ray/includes/object_ref.pxi) | `ObjectRef` (L37) |       
+      872 +| [`python/ray/util/placement_group.py`](https://github.com/ra
+          +y-project/ray/blob/25da7108abbec7606e8e0ce057e3a5d22421850f/py
+          +thon/ray/util/placement_group.py) | `PlacementGroup` (L42), `p
+          +lacement_group()` (L146) |                                    
+      873 +| [`python/ray/util/collective/collective.py`](https://github.
+          +com/ray-project/ray/blob/25da7108abbec7606e8e0ce057e3a5d224218
+          +50f/python/ray/util/collective/collective.py) | `GroupManager`
+          + (L71) |                                                      
+      874 +| [`python/ray/util/collective/collective_group/nccl_collectiv
+          +e_group.py`](https://github.com/ray-project/ray/blob/25da7108a
+          +bbec7606e8e0ce057e3a5d22421850f/python/ray/util/collective/col
+          +lective_group/nccl_collective_group.py) | NCCL backend |      
+      875 +| [`python/ray/train/torch/torch_trainer.py`](https://github.c
+          +om/ray-project/ray/blob/25da7108abbec7606e8e0ce057e3a5d2242185
+          +0f/python/ray/train/torch/torch_trainer.py) | `TorchTrainer` (
+          +L11) |                                                        
+      876 +| [`python/ray/train/trainer.py`](https://github.com/ray-proje
+          +ct/ray/blob/25da7108abbec7606e8e0ce057e3a5d22421850f/python/ra
+          +y/train/trainer.py) | `TrainingIterator` (L36) |              
+      877 +| [`src/ray/core_worker/core_worker.h`](https://github.com/ray
+          +-project/ray/blob/25da7108abbec7606e8e0ce057e3a5d22421850f/src
+          +/ray/core_worker/core_worker.h) | C++ CoreWorker (L167) |     
+      878 +| [`src/ray/core_worker/actor_handle.h`](https://github.com/ra
+          +y-project/ray/blob/25da7108abbec7606e8e0ce057e3a5d22421850f/sr
+          +c/ray/core_worker/actor_handle.h) | C++ ActorHandle (L34), `al
+          +low_out_of_order_execution` (L51) |                           
+      879 +| [`src/ray/gcs/gcs_server.h`](https://github.com/ray-project/
+          +ray/blob/25da7108abbec7606e8e0ce057e3a5d22421850f/src/ray/gcs/
+          +gcs_server.h) | GCS server (L98) |                            
+      880 +| [`src/ray/gcs/gcs_actor_manager.h`](https://github.com/ray-p
+          +roject/ray/blob/25da7108abbec7606e8e0ce057e3a5d22421850f/src/r
+          +ay/gcs/gcs_actor_manager.h) | GCS actor lifecycle (L93) |     
+      881 +| [`src/ray/gcs/gcs_actor_manager.cc`](https://github.com/ray-
+          +project/ray/blob/25da7108abbec7606e8e0ce057e3a5d22421850f/src/
+          +ray/gcs/gcs_actor_manager.cc) | Actor restart logic (2032 line
+          +s) |                                                          
+      882 +| [`src/ray/raylet/node_manager.h`](https://github.com/ray-pro
+          +ject/ray/blob/25da7108abbec7606e8e0ce057e3a5d22421850f/src/ray
+          +/raylet/node_manager.h) | Raylet NodeManager (L70) |          
+      883 +| [`src/ray/raylet/placement_group_resource_manager.h`](https:
+          +//github.com/ray-project/ray/blob/25da7108abbec7606e8e0ce057e3
+          +a5d22421850f/src/ray/raylet/placement_group_resource_manager.h
+          +) | C++ PG resource manager (L49) |                           
+      884 +                                                              
+      885 +### Notebook References (this repo)                           
+      886 +                                                              
+      887 +| Notebook | Concepts |                                       
+      888 +|----------|----------|                                       
+      889 +| [`notebooks/01_history_and_vision.py`](../notebooks/01_histo
+          +ry_and_vision.py) | Actor model, PingPong, meshes, Ports, mess
+          +age ordering |                                                
+      890 +| [`notebooks/02_interactive_devx.py`](../notebooks/02_interac
+          +tive_devx.py) | Single controller, SPMD, `serve()`, interactiv
+          +e development |                                               
+      891 +| [`notebooks/03_fault_tolerance.py`](../notebooks/03_fault_to
+          +lerance.py) | Supervision trees, `__supervise__`, TorchFT |   
+      892 +| [`notebooks/04_distributed_tensors.py`](../notebooks/04_dist
+          +ributed_tensors.py) | Mesh reshape, distributed tensor ops, re
+          +duce, inspect |                                               
+      893 +| [`notebooks/07_rdma_weight_sync.py`](../notebooks/07_rdma_we
+          +ight_sync.py) | RDMABuffer, magic pointer pattern |           
+      894 +| [`notebooks/07b_weight_sync_deep_dive.py`](../notebooks/07b_
+          +weight_sync_deep_dive.py) | ibverbs, RdmaController, queue pai
+          +rs |                                                          
+
+● Now let me check on the TUI agent and start creating the demo scripts.
+
+● Task Output(non-blocking) a00543e
+  ⎿  Read output (ctrl+o to expand)
+
+● The TUI library is complete. Let me verify the files were created correctly,
+  then start on the demo scripts.
+
+● Let me quickly verify the TUI library files exist and read them to make sure
+  they're correct.
+
+● Searched for 1 pattern (ctrl+o to expand)
+
+● Good, all 4 files exist. Now I'll create the demo scripts directory and all 8
+  demo scripts. Let me launch this as parallel background agents to work
+  efficiently.
+
+● Bash(mkdir -p /mnt/data_infra/workspace/monarch-gpu-mode/scripts/demos)
+  ⎿  (No content)
+
+● Now let me create all 8 demo scripts. I'll write them in parallel batches.
+
+● Write(scripts/demos/01_actor_abstraction.py)
+  ⎿  Wrote 206 lines to scripts/demos/01_actor_abstraction.py
+       1 #!/usr/bin/env python3
+       2 """Demo 01: Actor Abstraction — Monarch vs Ray.
+       3 
+       4 Shows actor creation and endpoint calls side by side.
+       5 Run: ./scripts/zephyr_uv_run.sh python scripts/demos/01_actor_ab
+         straction.py [--dry-run]
+       6 """
+       7 
+       8 from __future__ import annotations
+       9 
+      10 import argparse
+     … +196 lines (ctrl+o to expand)
+
+● Write(scripts/demos/02_topology_meshes.py)
+  ⎿  Wrote 101 lines to scripts/demos/02_topology_meshes.py
+       1 #!/usr/bin/env python3
+       2 """Demo 02: Topology — Meshes (Monarch) vs Flat Handles (Ray).
+       3 
+       4 Shows mesh creation, slicing, and reshape vs placement groups.
+       5 Run: ./scripts/zephyr_uv_run.sh python scripts/demos/02_topology
+         _meshes.py [--dry-run]
+       6 """
+       7 
+       8 from __future__ import annotations
+       9 
+      10 import argparse
+     … +91 lines (ctrl+o to expand)
+
+● Write(scripts/demos/03_control_plane.py)
+  ⎿  Wrote 125 lines to scripts/demos/03_control_plane.py
+       1 #!/usr/bin/env python3
+       2 """Demo 03: Control Plane Messaging — call_one, call, stream, br
+         oadcast.
+       3 
+       4 Shows Monarch's 4 messaging patterns vs Ray's ObjectRef model.
+       5 Run: ./scripts/zephyr_uv_run.sh python scripts/demos/03_control_
+         plane.py [--dry-run]
+       6 """
+       7 
+       8 from __future__ import annotations
+       9 
+      10 import argparse
+     … +115 lines (ctrl+o to expand)
+
+● Write(scripts/demos/04_message_ordering.py)
+  ⎿  Wrote 115 lines to scripts/demos/04_message_ordering.py
+      1 #!/usr/bin/env python3
+      2 """Demo 04: Message Ordering — per-sender FIFO (Monarch) vs optio
+        nal ordering (Ray).
+      3 
+      4 Shows how Monarch guarantees message ordering via Rust-level sequ
+        ence numbers,
+      5 while Ray provides ordering only as a side effect of max_concurre
+        ncy=1.
+      6 Run: ./scripts/zephyr_uv_run.sh python scripts/demos/04_message_o
+        rdering.py [--dry-run]
+      7 """
+      8 
+      9 from __future__ import annotations
+     … +105 lines (ctrl+o to expand)
+
+● Write(scripts/demos/05_supervision.py)
+  ⎿  Wrote 99 lines to scripts/demos/05_supervision.py
+       1 #!/usr/bin/env python3
+       2 """Demo 05: Supervision and Fault Tolerance — Erlang-style (Mona
+         rch) vs max_restarts (Ray).
+       3 
+       4 Shows supervision trees and failure propagation vs flat restart 
+         policies.
+       5 Run: ./scripts/zephyr_uv_run.sh python scripts/demos/05_supervis
+         ion.py [--dry-run]
+       6 """
+       7 
+       8 from __future__ import annotations
+       9 
+      10 import argparse
+     … +89 lines (ctrl+o to expand)
+
+● Write(scripts/demos/06_data_plane_rdma.py)
+  ⎿  Wrote 128 lines to scripts/demos/06_data_plane_rdma.py
+       1 #!/usr/bin/env python3
+       2 """Demo 06: Data Plane — RDMA (Monarch) vs Object Store (Ray).
+       3 
+       4 Shows one-sided RDMA reads vs Plasma object store for weight tra
+         nsfer.
+       5 Run: ./scripts/zephyr_uv_run.sh python scripts/demos/06_data_pla
+         ne_rdma.py [--dry-run]
+       6 """
+       7 
+       8 from __future__ import annotations
+       9 
+      10 import argparse
+     … +118 lines (ctrl+o to expand)
+
+● Write(scripts/demos/07_distributed_tensors.py)
+  ⎿  Wrote 131 lines to scripts/demos/07_distributed_tensors.py
+      1 #!/usr/bin/env python3
+      2 """Demo 07: Distributed Tensors — first-class (Monarch) vs DDP wr
+        apper (Ray).
+      3 
+      4 Shows Monarch's DeviceMesh.activate() and distributed tensor ops
+      5 vs Ray Train's TorchTrainer wrapping DDP.
+      6 Run: ./scripts/zephyr_uv_run.sh python scripts/demos/07_distribut
+        ed_tensors.py [--dry-run]
+      7 """
+      8 
+      9 from __future__ import annotations
+     … +121 lines (ctrl+o to expand)
+
+● Write(scripts/demos/08_interactive_devx.py)
+  ⎿  Wrote 119 lines to scripts/demos/08_interactive_devx.py
+       1 #!/usr/bin/env python3
+       2 """Demo 08: Interactive DevX — Single Controller (Monarch) vs Jo
+         b Submission (Ray).
+       3 
+       4 Shows Monarch's notebook-as-controller paradigm vs Ray's job sub
+         mission model.
+       5 Run: ./scripts/zephyr_uv_run.sh python scripts/demos/08_interact
+         ive_devx.py [--dry-run]
+       6 """
+       7 
+       8 from __future__ import annotations
+       9 
+      10 import argparse
+     … +109 lines (ctrl+o to expand)
+
+● All 8 demo scripts are created. Let me update the task status and move to
+  tests.
+  ⎿  You've hit your limit · resets 6am (UTC)
+     /upgrade or /extra-usage to finish what you’re working on.
+
+✻ Crunched for 8m 32s
+
+● Agent "Create demo_tui library files" completed
+  ⎿  You've hit your limit · resets 6am (UTC)
+     /upgrade or /extra-usage to finish what you’re working on.
+
+❯ /rate-limit-options 
+  ⎿  Login successful
+
+❯ /rate-limit-options 
+  ⎿  Login interrupted
+
+❯ /extra-usage 
+  ⎿  Login successful
+
+❯ continue 
+  ⎿  You've hit your limit · resets 6am (UTC)
+     /upgrade or /extra-usage to finish what you’re working on.
+
+❯ /export 
+  ⎿  Export cancelled

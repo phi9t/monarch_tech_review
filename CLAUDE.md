@@ -9,7 +9,8 @@ Interactive [marimo](https://marimo.io) notebooks for a GPU Mode presentation on
 ## Execution Policy (Zephyr Infra)
 
 - Run commands through Zephyr container infra.
-- Use `./scripts/zephyr_shell.sh` for interactive shell access.
+- Use `./scripts/zephyr_shell.sh` for interactive shell access (defaults to snapshot image `sygaldry/zephyr:spack`).
+- Override image if needed: `./scripts/zephyr_shell.sh --image sygaldry/zephyr:base`.
 - Use `./scripts/zephyr_uv_sync.sh` to manage `.venv`.
 - Use `./scripts/zephyr_uv_run.sh ...` for repo commands (`marimo`, `pytest`, `ruff`, scripts).
 - Do not install upstream PyTorch/CUDA wheel packages in `.venv`; Zephyr-provided packages from `/opt/spack_store/view` are the source of truth.
