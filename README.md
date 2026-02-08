@@ -49,6 +49,15 @@ cd monarch-gpu-mode
 uv sync
 ```
 
+### Zephyr container mode
+
+On Zephyr infra, use the wrappers below to enforce `.venv` on Spack Python with system site-packages and avoid installing upstream Torch wheels:
+
+```bash
+./scripts/zephyr_uv_sync.sh
+./scripts/zephyr_uv_run.sh marimo edit notebooks/01_history_and_vision.py
+```
+
 ## Running the Notebooks
 
 ### Option 1: Interactive mode (recommended)
@@ -63,6 +72,12 @@ uv run marimo edit notebooks/01_history_and_vision.py
 uv run marimo edit notebooks/08_rl_e2e.py
 ```
 
+On Zephyr infra, prefer:
+
+```bash
+./scripts/zephyr_uv_run.sh marimo edit notebooks/01_history_and_vision.py
+```
+
 ### Option 2: App mode (read-only)
 
 This runs the notebook as a read-only app:
@@ -75,6 +90,12 @@ uv run marimo run notebooks/01_history_and_vision.py
 
 ```bash
 uv run marimo export html notebooks/01_history_and_vision.py -o output.html
+```
+
+On Zephyr infra:
+
+```bash
+./scripts/zephyr_uv_run.sh marimo export html notebooks/01_history_and_vision.py -o output.html
 ```
 
 ## Development

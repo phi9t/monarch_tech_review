@@ -5,11 +5,12 @@ description = "Marimo notebooks for GPU Mode presentation on Monarch"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "torch==2.10.0",
+    "torch==2.9.0",
     "marimo>=0.19.9",
     "transformers>=4.40.0",
     "torchmonarch==0.3.0",
     "accelerate",
+    "rich>=13.9.0",
     "html5lib",
     "matplotlib>=3.10.8",
     "scipy>=1.15.3",

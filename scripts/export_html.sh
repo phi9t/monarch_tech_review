@@ -12,6 +12,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 NOTEBOOKS_DIR="$PROJECT_DIR/notebooks"
 OUTPUT_DIR="$PROJECT_DIR/docs"
+ZEPHYR_RUNNER="$PROJECT_DIR/scripts/zephyr_uv_run.sh"
+
+if [ -x "$ZEPHYR_RUNNER" ] && [ -x "/opt/spack_store/view/bin/python" ]; then
+    RUN_CMD=("$ZEPHYR_RUNNER")
+else
+    RUN_CMD=("uv" "run")
+fi
 
 # Create output directory if it doesn't exist
 mkdir -p "$OUTPUT_DIR"
@@ -31,7 +38,7 @@ for notebook in "$NOTEBOOKS_DIR"/*.py; do
 
         # Run marimo export (runs the notebook and captures output)
         # -f forces overwrite without prompting
-        uv run marimo export html "$notebook" -o "$output_file" --include-code -f 2>&1 || {
+        "${RUN_CMD[@]}" marimo export html "$notebook" -o "$output_file" --include-code -f 2>&1 || {
             echo "  WARNING: Failed to export $basename.py (might have execution errors)"
             continue
         }
